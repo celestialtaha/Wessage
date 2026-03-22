@@ -22,6 +22,11 @@ class SecureSyncCodec(
 ) {
     private val prefs = context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val secureRandom = SecureRandom()
+    private val sessionKeyCache =
+        object : LinkedHashMap<String, SecretKeySpec>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SecretKeySpec>?): Boolean =
+                size > SESSION_KEY_CACHE_SIZE
+        }
     private val localKeys: KeyPair by lazy { getOrCreateLocalKeyPair() }
     private val deviceId: String by lazy { getOrCreateDeviceId() }
 
@@ -56,7 +61,11 @@ class SecureSyncCodec(
     ): ByteArray? {
         val peerPublicB64 = getPeerPublicKey(nodeId) ?: return null
         val peerPublic = peerPublicB64.toPublicKey() ?: return null
-        val secret = deriveSessionKey(localKeys.private.encoded, peerPublic)
+        val secret =
+            getOrDeriveSessionKey(
+                cacheKey = "tx|$nodeId|$peerPublicB64",
+                remotePublicKey = peerPublic,
+            )
         val counter = nextCounter(nodeId)
         val nonce = ByteArray(NONCE_SIZE).also(secureRandom::nextBytes)
         val timestamp = System.currentTimeMillis()
@@ -108,7 +117,11 @@ class SecureSyncCodec(
             }
 
             val senderPublic = senderPublicB64.toPublicKey() ?: return null
-            val secret = deriveSessionKey(localKeys.private.encoded, senderPublic)
+            val secret =
+                getOrDeriveSessionKey(
+                    cacheKey = "rx|$sourceNodeId|$senderPublicB64",
+                    remotePublicKey = senderPublic,
+                )
             val aad = buildAad(path = path, counter = counter, sender = senderDeviceId, timestamp = timestamp)
 
             val cipher = Cipher.getInstance(AES_MODE)
@@ -159,6 +172,7 @@ class SecureSyncCodec(
             .putString(peerPublicKeyPref(nodeId), publicKeyB64)
             .putString(peerDeviceIdPref(nodeId), peerDeviceId)
             .apply()
+        evictCachedSessionKeys(nodeId)
     }
 
     private fun nextCounter(nodeId: String): Long {
@@ -191,6 +205,33 @@ class SecureSyncCodec(
         val prk = hmac(SALT, shared)
         val okm = hkdfExpand(prk = prk, info = INFO, size = 32)
         return SecretKeySpec(okm, "AES")
+    }
+
+    private fun getOrDeriveSessionKey(
+        cacheKey: String,
+        remotePublicKey: PublicKey,
+    ): SecretKeySpec {
+        synchronized(sessionKeyCache) {
+            sessionKeyCache[cacheKey]?.let { return it }
+        }
+        val derived = deriveSessionKey(localKeys.private.encoded, remotePublicKey)
+        synchronized(sessionKeyCache) {
+            sessionKeyCache[cacheKey] = derived
+        }
+        return derived
+    }
+
+    private fun evictCachedSessionKeys(nodeId: String) {
+        val marker = "|$nodeId|"
+        synchronized(sessionKeyCache) {
+            val iterator = sessionKeyCache.keys.iterator()
+            while (iterator.hasNext()) {
+                val key = iterator.next()
+                if (key.contains(marker)) {
+                    iterator.remove()
+                }
+            }
+        }
     }
 
     private fun hmac(
@@ -263,6 +304,7 @@ class SecureSyncCodec(
         private const val NONCE_SIZE = 12
         private const val ENVELOPE_VERSION = 1
         private const val KID = "ec-p256-v1"
+        private const val SESSION_KEY_CACHE_SIZE = 24
         private val SALT = "wessage-sync-salt-v1".toByteArray(Charsets.UTF_8)
         private val INFO = "wessage-sync-aes256-gcm-v1".toByteArray(Charsets.UTF_8)
     }

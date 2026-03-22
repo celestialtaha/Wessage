@@ -16,6 +16,7 @@ import kotlin.math.absoluteValue
 class MessagingViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(WearMessagingUiState())
     val uiState: StateFlow<WearMessagingUiState> = _uiState.asStateFlow()
+    private var hasReceivedSyncPayload = false
 
     init {
         bootstrapData()
@@ -203,103 +204,21 @@ class MessagingViewModel : ViewModel() {
                 it.copy(
                     conversationsState = ConversationsUiState.Loading,
                     syncStatus = SyncStatus.Syncing,
+                    messagesByConversation = emptyMap(),
                 )
             }
-            delay(450)
-            val now = System.currentTimeMillis()
-            val seedConversations =
-                listOf(
-                    Conversation(
-                        id = "team",
-                        title = "Product Team",
-                        participants = listOf("Nia", "Zayd", "You"),
-                        lastMessage = "Ship window moved to 17:30.",
-                        lastUpdatedAt = (now - 2 * 60_000L).toRelativeTimestampLabel(now),
-                        lastUpdatedAtEpochMillis = now - 2 * 60_000L,
-                        unreadCount = 3,
-                    ),
-                    Conversation(
-                        id = "sam",
-                        title = "Samir",
-                        participants = listOf("Samir", "You"),
-                        lastMessage = "Lunch near Alexanderplatz?",
-                        lastUpdatedAt = (now - 9 * 60_000L).toRelativeTimestampLabel(now),
-                        lastUpdatedAtEpochMillis = now - 9 * 60_000L,
-                        unreadCount = 1,
-                    ),
-                    Conversation(
-                        id = "ops",
-                        title = "Ops Alerts",
-                        participants = listOf("Pager", "You"),
-                        lastMessage = "API latency normalized.",
-                        lastUpdatedAt = (now - 24 * 60_000L).toRelativeTimestampLabel(now),
-                        lastUpdatedAtEpochMillis = now - 24 * 60_000L,
-                        unreadCount = 0,
-                        muted = true,
-                    ),
-                )
-            val seedMessages =
-                mapOf(
-                    "team" to
-                        listOf(
-                            Message(
-                                id = "m-team-1",
-                                conversationId = "team",
-                                senderId = "nia",
-                                senderName = "Nia",
-                                body = "We merged the watch quick reply flow.",
-                                timestamp = "10:11",
-                                status = MessageStatus.Read,
-                                localVersion = 1,
-                                outgoing = false,
-                            ),
-                            Message(
-                                id = "m-team-2",
-                                conversationId = "team",
-                                senderId = "zayd",
-                                senderName = "Zayd",
-                                body = "Ship window moved to 17:30.",
-                                timestamp = "10:14",
-                                status = MessageStatus.Delivered,
-                                localVersion = 1,
-                                outgoing = false,
-                            ),
-                        ),
-                    "sam" to
-                        listOf(
-                            Message(
-                                id = "m-sam-1",
-                                conversationId = "sam",
-                                senderId = "sam",
-                                senderName = "Samir",
-                                body = "Lunch near Alexanderplatz?",
-                                timestamp = "10:03",
-                                status = MessageStatus.Delivered,
-                                localVersion = 1,
-                                outgoing = false,
-                            )
-                        ),
-                    "ops" to
-                        listOf(
-                            Message(
-                                id = "m-ops-1",
-                                conversationId = "ops",
-                                senderId = "opsbot",
-                                senderName = "Ops Bot",
-                                body = "API latency normalized.",
-                                timestamp = "09:40",
-                                status = MessageStatus.Read,
-                                localVersion = 1,
-                                outgoing = false,
-                            )
-                        ),
-                )
-            _uiState.update {
-                it.copy(
-                    conversationsState = ConversationsUiState.Success(seedConversations),
-                    messagesByConversation = seedMessages,
-                    syncStatus = SyncStatus.Idle,
-                )
+            delay(2_000)
+            if (!hasReceivedSyncPayload) {
+                _uiState.update { state ->
+                    if (state.conversationsState is ConversationsUiState.Loading) {
+                        state.copy(
+                            conversationsState = ConversationsUiState.Empty,
+                            syncStatus = SyncStatus.Idle,
+                        )
+                    } else {
+                        state
+                    }
+                }
             }
         }
     }
@@ -317,6 +236,7 @@ class MessagingViewModel : ViewModel() {
     }
 
     private fun applyConversationDelta(batch: com.wapp.wearmessage.sync.contract.ConversationDeltaBatch) {
+        hasReceivedSyncPayload = true
         _uiState.update { state ->
             val mergedById =
                 mutableMapOf<String, Conversation>().apply {
@@ -363,6 +283,7 @@ class MessagingViewModel : ViewModel() {
     }
 
     private fun applyMessageDelta(batch: com.wapp.wearmessage.sync.contract.MessageDeltaBatch) {
+        hasReceivedSyncPayload = true
         _uiState.update { state ->
             val groupedMessages = batch.messages.groupBy { it.conversationId }
             val mappedByConversation =

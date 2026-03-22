@@ -88,20 +88,31 @@ fun WearMessagingApp(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val compactScreen = isCompactRoundScreen()
     val canSwipeBack = uiState.currentScreen != WearScreen.Conversations
-    var conversationRequestLimit by remember { mutableStateOf(INITIAL_CONVERSATION_LIMIT) }
+    val loadedConversationCount =
+        (uiState.conversationsState as? ConversationsUiState.Success)
+            ?.conversations
+            ?.size ?: 0
     var loadingMoreConversations by remember { mutableStateOf(false) }
     var conversationsExhausted by remember { mutableStateOf(false) }
+    var pendingPageOffset by remember { mutableStateOf<Int?>(null) }
+    var pendingPageLimit by remember { mutableStateOf(0) }
 
-    LaunchedEffect(uiState.conversationsState, conversationRequestLimit) {
-        val loadedCount =
-            (uiState.conversationsState as? ConversationsUiState.Success)
-                ?.conversations
-                ?.size ?: return@LaunchedEffect
-        conversationsExhausted = loadedCount < conversationRequestLimit
+    LaunchedEffect(loadedConversationCount, pendingPageOffset, pendingPageLimit) {
+        val offset = pendingPageOffset ?: return@LaunchedEffect
+        val newItemsCount = (loadedConversationCount - offset).coerceAtLeast(0)
+        conversationsExhausted = newItemsCount < pendingPageLimit
+        loadingMoreConversations = false
+        pendingPageOffset = null
+        pendingPageLimit = 0
     }
 
     LaunchedEffect(Unit) {
-        syncTransport.requestBootstrapSync(limit = conversationRequestLimit)
+        pendingPageOffset = 0
+        pendingPageLimit = INITIAL_CONVERSATION_LIMIT
+        syncTransport.requestBootstrapSync(
+            limit = INITIAL_CONVERSATION_LIMIT,
+            offset = 0,
+        )
     }
 
     AppScaffold {
@@ -127,18 +138,25 @@ fun WearMessagingApp(
                         isLoadingMore = loadingMoreConversations,
                         onLoadMoreConversations = {
                             if (!loadingMoreConversations && !conversationsExhausted) {
+                                val nextOffset = loadedConversationCount
+                                if (nextOffset >= MAX_CONVERSATION_COUNT) {
+                                    conversationsExhausted = true
+                                    return@ConversationsScreen
+                                }
                                 loadingMoreConversations = true
                                 scope.launch {
-                                    val nextLimit = (conversationRequestLimit + CONVERSATION_PAGE_SIZE).coerceAtMost(MAX_CONVERSATION_LIMIT)
-                                    if (nextLimit <= conversationRequestLimit) {
-                                        conversationsExhausted = true
-                                    } else {
-                                        val sent = syncTransport.requestBootstrapSync(limit = nextLimit)
-                                        if (sent) {
-                                            conversationRequestLimit = nextLimit
-                                        }
+                                    pendingPageOffset = nextOffset
+                                    pendingPageLimit = CONVERSATION_PAGE_SIZE
+                                    val sent =
+                                        syncTransport.requestBootstrapSync(
+                                            limit = CONVERSATION_PAGE_SIZE,
+                                            offset = nextOffset,
+                                        )
+                                    if (!sent) {
+                                        loadingMoreConversations = false
+                                        pendingPageOffset = null
+                                        pendingPageLimit = 0
                                     }
-                                    loadingMoreConversations = false
                                 }
                             }
                         },
@@ -777,6 +795,6 @@ private fun newMutationId(): String =
 
 private const val INITIAL_CONVERSATION_LIMIT = 25
 private const val CONVERSATION_PAGE_SIZE = 20
-private const val MAX_CONVERSATION_LIMIT = 300
+private const val MAX_CONVERSATION_COUNT = 300
 private const val LOAD_MORE_TRIGGER_PREFIX_ITEMS = 3
 private const val LOAD_MORE_THRESHOLD_ITEMS = 4
