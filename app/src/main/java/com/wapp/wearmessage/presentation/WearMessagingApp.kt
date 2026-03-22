@@ -1,7 +1,11 @@
 package com.wapp.wearmessage.presentation
 
+import android.app.Activity
+import android.content.Intent
+import android.speech.RecognizerIntent
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -15,15 +19,29 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.wear.compose.foundation.BasicSwipeToDismissBox
@@ -33,6 +51,8 @@ import androidx.wear.compose.foundation.lazy.ScalingLazyListState
 import androidx.wear.compose.foundation.lazy.items
 import androidx.wear.compose.foundation.lazy.rememberScalingLazyListState
 import androidx.wear.compose.material3.AppScaffold
+import androidx.wear.compose.material3.AlertDialog
+import androidx.wear.compose.material3.AlertDialogDefaults
 import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.Card
 import androidx.wear.compose.material3.CardDefaults
@@ -49,6 +69,7 @@ import androidx.wear.compose.material3.Text
 import com.wapp.wearmessage.sync.WearSyncTransport
 import com.wapp.wearmessage.sync.contract.WatchMutation
 import com.wapp.wearmessage.sync.contract.WatchMutationType
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
@@ -316,19 +337,75 @@ private fun ThreadScreen(
     onArchive: () -> Unit,
 ) {
     val quickReplies = remember { listOf("On my way", "Seen", "Call later") }
+    val expandedMessageIds = remember { mutableStateListOf<String>() }
+    var keyboardComposerVisible by remember { mutableStateOf(false) }
+    var keyboardDraft by remember { mutableStateOf("") }
+    val voiceReplyLauncher =
+        rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
+            if (result.resultCode != Activity.RESULT_OK) return@rememberLauncherForActivityResult
+            val voiceText =
+                result.data
+                    ?.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS)
+                    ?.firstOrNull()
+                    ?.trim()
+                    .orEmpty()
+            if (voiceText.isNotBlank()) {
+                onQuickReply(voiceText)
+            }
+        }
+
+    fun submitReply(text: String) {
+        val normalized = text.trim()
+        if (normalized.isBlank()) return
+        onQuickReply(normalized)
+        keyboardDraft = ""
+        keyboardComposerVisible = false
+    }
+
+    fun toggleExpanded(messageId: String) {
+        if (expandedMessageIds.contains(messageId)) {
+            expandedMessageIds.remove(messageId)
+        } else {
+            expandedMessageIds.add(messageId)
+        }
+    }
+
     WearScreenShell(compactScreen = compactScreen) {
         item {
             ListHeader { Text(conversation?.title ?: "Conversation") }
         }
-        item { ListSubHeader { Text("Quick actions") } }
-        items(quickReplies, key = { it }) { quickReply ->
-            FilledTonalButton(
-                onClick = { onQuickReply(quickReply) },
-                enabled = actionsEnabled,
-            ) {
-                Text(quickReply)
+        item { ListSubHeader { Text("Messages") } }
+        if (messages.isEmpty()) {
+            item {
+                Text(
+                    text = "No messages cached yet.",
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        } else {
+            items(messages, key = { it.id }) { message ->
+                MessageBubble(
+                    message = message,
+                    compactScreen = compactScreen,
+                    expanded = expandedMessageIds.contains(message.id),
+                    actionsEnabled = actionsEnabled,
+                    quickReplies = quickReplies,
+                    onToggleExpanded = { toggleExpanded(message.id) },
+                    onQuickReply = { submitReply(it) },
+                    onVoiceReply = {
+                        val intent = createVoiceReplyIntent(conversation?.title)
+                        runCatching { voiceReplyLauncher.launch(intent) }
+                            .onFailure {
+                                keyboardComposerVisible = true
+                            }
+                    },
+                    onKeyboardReply = {
+                        keyboardComposerVisible = true
+                    },
+                )
             }
         }
+        item { ListSubHeader { Text("Thread actions") } }
         item {
             Button(onClick = onMarkRead, enabled = actionsEnabled) { Text("Mark read") }
         }
@@ -342,21 +419,25 @@ private fun ThreadScreen(
                 Text("Archive")
             }
         }
-        item { ListSubHeader { Text("Messages") } }
-        if (messages.isEmpty()) {
-            item {
-                Text(
-                    text = "No messages cached yet.",
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-        } else {
-            items(messages, key = { it.id }) { message ->
-                MessageBubble(message = message, compactScreen = compactScreen)
-            }
-        }
     }
+
+    KeyboardReplyDialog(
+        visible = keyboardComposerVisible,
+        conversation = conversation,
+        draft = keyboardDraft,
+        onDraftChange = { keyboardDraft = it },
+        onDismissRequest = { keyboardComposerVisible = false },
+        onSend = { submitReply(keyboardDraft) },
+    )
 }
+
+private fun createVoiceReplyIntent(conversationTitle: String?): Intent =
+    Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+        putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+        putExtra(RecognizerIntent.EXTRA_PROMPT, "Reply to ${conversationTitle ?: "thread"}")
+        putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 1)
+        putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
+    }
 
 @Composable
 private fun SettingsScreen(
@@ -491,10 +572,17 @@ private fun ConversationCard(
 private fun MessageBubble(
     message: Message,
     compactScreen: Boolean,
+    expanded: Boolean,
+    actionsEnabled: Boolean,
+    quickReplies: List<String>,
+    onToggleExpanded: () -> Unit,
+    onQuickReply: (String) -> Unit,
+    onVoiceReply: () -> Unit,
+    onKeyboardReply: () -> Unit,
 ) {
     Card(
-        onClick = {},
-        enabled = false,
+        onClick = onToggleExpanded,
+        enabled = true,
         colors = glassCardColors(),
         border = glassBorder(),
     ) {
@@ -503,13 +591,127 @@ private fun MessageBubble(
             color = MaterialTheme.colorScheme.primary,
         )
         Spacer(modifier = Modifier.height(if (compactScreen) 1.dp else 3.dp))
-        Text(text = message.body, maxLines = if (compactScreen) 2 else 3, overflow = TextOverflow.Ellipsis)
+        Text(
+            text = message.body,
+            maxLines = if (expanded) Int.MAX_VALUE else if (compactScreen) 2 else 3,
+            overflow = if (expanded) TextOverflow.Visible else TextOverflow.Ellipsis,
+        )
         Spacer(modifier = Modifier.height(4.dp))
         Text(
             text = "${message.timestamp}  ${message.status.name.lowercase()}",
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(
+            text = if (expanded) "Tap to collapse" else "Tap to expand",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+        )
+
+        if (expanded && actionsEnabled) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Text(
+                text = "Quick actions",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+            )
+            Spacer(modifier = Modifier.height(4.dp))
+            quickReplies.forEach { quickReply ->
+                FilledTonalButton(
+                    onClick = { onQuickReply(quickReply) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(quickReply)
+                }
+            }
+            OutlinedButton(
+                onClick = onKeyboardReply,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Keyboard input")
+            }
+            OutlinedButton(
+                onClick = onVoiceReply,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text("Voice input")
+            }
+        }
     }
+}
+
+@Composable
+private fun KeyboardReplyDialog(
+    visible: Boolean,
+    conversation: Conversation?,
+    draft: String,
+    onDraftChange: (String) -> Unit,
+    onDismissRequest: () -> Unit,
+    onSend: () -> Unit,
+) {
+    val focusRequester = remember { FocusRequester() }
+    val keyboardController = LocalSoftwareKeyboardController.current
+    LaunchedEffect(visible) {
+        if (visible) {
+            delay(150)
+            focusRequester.requestFocus()
+            keyboardController?.show()
+        }
+    }
+
+    AlertDialog(
+        visible = visible,
+        onDismissRequest = onDismissRequest,
+        title = { Text("Reply to ${conversation?.title ?: "thread"}") },
+        text = { Text("Use keyboard input and send.") },
+        confirmButton = {
+            AlertDialogDefaults.ConfirmButton(
+                onClick = {
+                    if (draft.isNotBlank()) onSend()
+                },
+            )
+        },
+        dismissButton = {
+            AlertDialogDefaults.DismissButton(onClick = onDismissRequest)
+        },
+        content = {
+            item {
+                Card(
+                    onClick = {},
+                    enabled = false,
+                    colors = glassCardColors(),
+                    border = glassBorder(),
+                ) {
+                    BasicTextField(
+                        value = draft,
+                        onValueChange = onDraftChange,
+                        modifier = Modifier.fillMaxWidth().focusRequester(focusRequester),
+                        textStyle = MaterialTheme.typography.bodyMedium,
+                        cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                        keyboardOptions =
+                            KeyboardOptions(
+                                capitalization = KeyboardCapitalization.Sentences,
+                                keyboardType = KeyboardType.Text,
+                                imeAction = ImeAction.Send,
+                            ),
+                        keyboardActions =
+                            KeyboardActions(
+                                onSend = { if (draft.isNotBlank()) onSend() },
+                            ),
+                        maxLines = 5,
+                    ) { innerTextField ->
+                        if (draft.isBlank()) {
+                            Text(
+                                text = "Type reply…",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        innerTextField()
+                    }
+                }
+            }
+        },
+    )
 }
 
 @Composable
