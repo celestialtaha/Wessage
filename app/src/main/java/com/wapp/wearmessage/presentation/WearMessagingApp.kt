@@ -252,6 +252,34 @@ private fun ConversationsScreen(
                 maxLines = 1,
             )
         }
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                FilledTonalIconButton(
+                    onClick = onOpenContacts,
+                    enabled = actionsEnabled,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(
+                        painter = painterResource(id = android.R.drawable.ic_menu_call),
+                        contentDescription = "Contacts",
+                    )
+                }
+                FilledTonalIconButton(
+                    onClick = onOpenSettings,
+                    enabled = actionsEnabled,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(
+                        painter = painterResource(id = android.R.drawable.ic_menu_manage),
+                        contentDescription = "Settings",
+                    )
+                }
+            }
+        }
         when (val state = uiState.conversationsState) {
             ConversationsUiState.Loading -> {
                 item {
@@ -318,17 +346,6 @@ private fun ConversationsScreen(
             }
         }
 
-        item { ListSubHeader { Text("Navigate") } }
-        item {
-            FilledTonalButton(onClick = onOpenContacts, enabled = actionsEnabled) {
-                Text("Contacts")
-            }
-        }
-        item {
-            OutlinedButton(onClick = onOpenSettings, enabled = actionsEnabled) {
-                Text("Settings")
-            }
-        }
     }
 }
 
@@ -796,5 +813,5 @@ private fun newMutationId(): String =
 private const val INITIAL_CONVERSATION_LIMIT = 25
 private const val CONVERSATION_PAGE_SIZE = 20
 private const val MAX_CONVERSATION_COUNT = 300
-private const val LOAD_MORE_TRIGGER_PREFIX_ITEMS = 3
+private const val LOAD_MORE_TRIGGER_PREFIX_ITEMS = 4
 private const val LOAD_MORE_THRESHOLD_ITEMS = 4
