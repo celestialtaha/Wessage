@@ -12,7 +12,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "com.wapp.wearmessage"
+        applicationId = "com.goodwy.smsmessenger"
         minSdk = 29
         targetSdk = 36
         versionCode = 1
@@ -21,6 +21,9 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
