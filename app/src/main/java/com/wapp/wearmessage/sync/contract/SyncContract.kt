@@ -56,6 +56,12 @@ data class MessageDeltaBatch(
     val deletedMessageIds: List<String> = emptyList(),
 )
 
+data class BootstrapRequest(
+    val schemaVersion: Int = SYNC_SCHEMA_VERSION,
+    val limit: Int = 25,
+    val offset: Int = 0,
+)
+
 enum class WatchMutationType {
     REPLY,
     MARK_READ,

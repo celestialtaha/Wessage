@@ -25,11 +25,13 @@ This document defines the shared payload contract used between:
 - `MessageDeltaBatch`
 - `WatchMutation`
 - `MutationAck`
+- `BootstrapRequest` (`limit`, `offset`)
 
 ## Required Behavior
 
 - Phone is authoritative for conversation and message state.
 - Watch sends user actions as `WatchMutation` with `clientMutationId`.
+- Watch can request paged bootstrap windows via `BootstrapRequest`.
 - Phone responds with `MutationAck` and advances server cursor/version.
 - All payloads must include `schemaVersion`.
 - Key exchange payloads are JSON and contain the sender P-256 public key.

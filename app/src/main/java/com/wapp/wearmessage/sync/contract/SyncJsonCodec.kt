@@ -4,6 +4,14 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 object SyncJsonCodec {
+    fun encodeBootstrapRequest(request: BootstrapRequest): ByteArray =
+        JSONObject()
+            .put("schemaVersion", request.schemaVersion)
+            .put("limit", request.limit)
+            .put("offset", request.offset)
+            .toString()
+            .toByteArray(Charsets.UTF_8)
+
     fun encodeWatchMutation(mutation: WatchMutation): ByteArray =
         JSONObject()
             .put("schemaVersion", mutation.schemaVersion)

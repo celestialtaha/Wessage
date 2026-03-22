@@ -65,6 +65,7 @@ class MessagingViewModel : ViewModel() {
     }
 
     fun queueQuickReply(conversationId: String, quickReply: String) {
+        val now = System.currentTimeMillis()
         val mutationId = "watch-${System.currentTimeMillis()}"
         val optimisticMessage =
             Message(
@@ -88,7 +89,11 @@ class MessagingViewModel : ViewModel() {
                         (conversationId to
                             (state.messagesByConversation[conversationId].orEmpty() + optimisticMessage)),
                 conversationsState = state.conversationsState.withUpdatedConversation(conversationId) {
-                    copy(lastMessage = quickReply, lastUpdatedAt = "Now")
+                    copy(
+                        lastMessage = quickReply,
+                        lastUpdatedAt = now.toRelativeTimestampLabel(),
+                        lastUpdatedAtEpochMillis = now,
+                    )
                 },
             )
         }
@@ -201,6 +206,7 @@ class MessagingViewModel : ViewModel() {
                 )
             }
             delay(450)
+            val now = System.currentTimeMillis()
             val seedConversations =
                 listOf(
                     Conversation(
@@ -208,7 +214,8 @@ class MessagingViewModel : ViewModel() {
                         title = "Product Team",
                         participants = listOf("Nia", "Zayd", "You"),
                         lastMessage = "Ship window moved to 17:30.",
-                        lastUpdatedAt = "2m",
+                        lastUpdatedAt = (now - 2 * 60_000L).toRelativeTimestampLabel(now),
+                        lastUpdatedAtEpochMillis = now - 2 * 60_000L,
                         unreadCount = 3,
                     ),
                     Conversation(
@@ -216,7 +223,8 @@ class MessagingViewModel : ViewModel() {
                         title = "Samir",
                         participants = listOf("Samir", "You"),
                         lastMessage = "Lunch near Alexanderplatz?",
-                        lastUpdatedAt = "9m",
+                        lastUpdatedAt = (now - 9 * 60_000L).toRelativeTimestampLabel(now),
+                        lastUpdatedAtEpochMillis = now - 9 * 60_000L,
                         unreadCount = 1,
                     ),
                     Conversation(
@@ -224,7 +232,8 @@ class MessagingViewModel : ViewModel() {
                         title = "Ops Alerts",
                         participants = listOf("Pager", "You"),
                         lastMessage = "API latency normalized.",
-                        lastUpdatedAt = "24m",
+                        lastUpdatedAt = (now - 24 * 60_000L).toRelativeTimestampLabel(now),
+                        lastUpdatedAtEpochMillis = now - 24 * 60_000L,
                         unreadCount = 0,
                         muted = true,
                     ),
@@ -309,23 +318,37 @@ class MessagingViewModel : ViewModel() {
 
     private fun applyConversationDelta(batch: com.wapp.wearmessage.sync.contract.ConversationDeltaBatch) {
         _uiState.update { state ->
+            val mergedById =
+                mutableMapOf<String, Conversation>().apply {
+                    putAll(
+                        (state.conversationsState as? ConversationsUiState.Success)
+                            ?.conversations
+                            .orEmpty()
+                            .associateBy { it.id }
+                    )
+                }
+
+            batch.deletedConversationIds.forEach { deletedId ->
+                mergedById.remove(deletedId)
+            }
+
+            batch.conversations.forEach { sync ->
+                mergedById[sync.id] =
+                    Conversation(
+                        id = sync.id,
+                        title = sync.participants.firstOrNull().orEmpty().ifBlank { "Conversation ${sync.id}" },
+                        participants = sync.participants,
+                        lastMessage = sync.lastMessage,
+                        lastUpdatedAt = sync.lastUpdatedAtEpochMillis.toRelativeTimestampLabel(),
+                        lastUpdatedAtEpochMillis = sync.lastUpdatedAtEpochMillis,
+                        unreadCount = sync.unreadCount,
+                        muted = sync.muted,
+                    )
+            }
+
             val conversations =
-                batch.conversations
-                    .map { sync ->
-                        sync to
-                            Conversation(
-                                id = sync.id,
-                                title = sync.participants.firstOrNull().orEmpty().ifBlank { "Conversation ${sync.id}" },
-                                participants = sync.participants,
-                                lastMessage = sync.lastMessage,
-                                lastUpdatedAt = sync.lastUpdatedAtEpochMillis.toRelativeTimestampLabel(),
-                                unreadCount = sync.unreadCount,
-                                muted = sync.muted,
-                            )
-                    }
-                    .filterNot { (sync, _) -> batch.deletedConversationIds.contains(sync.id) }
-                    .sortedByDescending { it.first.lastUpdatedAtEpochMillis }
-                    .map { it.second }
+                mergedById.values
+                    .sortedByDescending { it.lastUpdatedAtEpochMillis }
 
             state.copy(
                 conversationsState =
@@ -426,11 +449,18 @@ private fun SyncMessageStatus.toMessageStatus(): MessageStatus =
     }
 
 private fun Long.toRelativeTimestampLabel(now: Long = System.currentTimeMillis()): String {
-    val deltaMinutes = ((now - this).coerceAtLeast(0L) / 60_000L).toInt()
+    val deltaMillis = (now - this).coerceAtLeast(0L)
+    val deltaMinutes = (deltaMillis / 60_000L).toInt()
+    val deltaHours = (deltaMillis / 3_600_000L).toInt()
+    val deltaDays = (deltaMillis / 86_400_000L).toInt()
     return when {
         deltaMinutes < 1 -> "now"
         deltaMinutes < 60 -> "${deltaMinutes}m"
-        else -> "${(deltaMinutes / 60)}h"
+        deltaHours < 24 -> "${deltaHours}h"
+        deltaDays < 7 -> "${deltaDays}d"
+        deltaDays < 30 -> "${(deltaDays / 7)}w"
+        deltaDays < 365 -> "${(deltaDays / 30)}mo"
+        else -> "${(deltaDays / 365)}y"
     }
 }
 

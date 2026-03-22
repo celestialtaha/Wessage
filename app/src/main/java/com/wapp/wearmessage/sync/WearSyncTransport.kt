@@ -7,6 +7,7 @@ import com.google.android.gms.wearable.Wearable
 import com.wapp.wearmessage.sync.contract.SyncJsonCodec
 import com.wapp.wearmessage.sync.contract.SyncPaths
 import com.wapp.wearmessage.sync.contract.WatchMutation
+import com.wapp.wearmessage.sync.contract.BootstrapRequest
 import com.wapp.wearmessage.sync.security.SecureSyncCodec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -19,10 +20,20 @@ class WearSyncTransport(
     private val messageClient by lazy { Wearable.getMessageClient(appContext) }
     private val secureCodec by lazy { SecureSyncCodec(appContext) }
 
-    suspend fun requestBootstrapSync(): Boolean =
+    suspend fun requestBootstrapSync(
+        limit: Int = DEFAULT_BOOTSTRAP_LIMIT,
+        offset: Int = 0,
+    ): Boolean =
         withContext(Dispatchers.IO) {
             runCatching {
                 val nodes = Tasks.await(nodeClient.connectedNodes)
+                val bootstrapPayload =
+                    SyncJsonCodec.encodeBootstrapRequest(
+                        BootstrapRequest(
+                            limit = limit.coerceIn(1, MAX_BOOTSTRAP_LIMIT),
+                            offset = offset.coerceAtLeast(0),
+                        )
+                    )
                 var sent = false
                 nodes.forEach { node ->
                     Tasks.await(
@@ -36,7 +47,7 @@ class WearSyncTransport(
                         messageClient.sendMessage(
                             node.id,
                             SyncPaths.BOOTSTRAP_REQUEST,
-                            ByteArray(0),
+                            bootstrapPayload,
                         )
                     )
                     sent = true
@@ -81,5 +92,7 @@ class WearSyncTransport(
 
     private companion object {
         private const val TAG = "WearSyncTransport"
+        private const val DEFAULT_BOOTSTRAP_LIMIT = 25
+        private const val MAX_BOOTSTRAP_LIMIT = 300
     }
 }

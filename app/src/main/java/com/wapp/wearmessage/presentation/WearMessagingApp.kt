@@ -73,7 +73,10 @@ import com.wapp.wearmessage.sync.WearSyncTransport
 import com.wapp.wearmessage.sync.contract.WatchMutation
 import com.wapp.wearmessage.sync.contract.WatchMutationType
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.filter
+import androidx.compose.runtime.snapshotFlow
 
 @Composable
 fun WearMessagingApp(
@@ -85,9 +88,20 @@ fun WearMessagingApp(
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val compactScreen = isCompactRoundScreen()
     val canSwipeBack = uiState.currentScreen != WearScreen.Conversations
+    var conversationRequestLimit by remember { mutableStateOf(INITIAL_CONVERSATION_LIMIT) }
+    var loadingMoreConversations by remember { mutableStateOf(false) }
+    var conversationsExhausted by remember { mutableStateOf(false) }
+
+    LaunchedEffect(uiState.conversationsState, conversationRequestLimit) {
+        val loadedCount =
+            (uiState.conversationsState as? ConversationsUiState.Success)
+                ?.conversations
+                ?.size ?: return@LaunchedEffect
+        conversationsExhausted = loadedCount < conversationRequestLimit
+    }
 
     LaunchedEffect(Unit) {
-        syncTransport.requestBootstrapSync()
+        syncTransport.requestBootstrapSync(limit = conversationRequestLimit)
     }
 
     AppScaffold {
@@ -109,6 +123,25 @@ fun WearMessagingApp(
                         uiState = uiState,
                         compactScreen = compactScreen,
                         actionsEnabled = !isBackground,
+                        canLoadMore = !conversationsExhausted,
+                        isLoadingMore = loadingMoreConversations,
+                        onLoadMoreConversations = {
+                            if (!loadingMoreConversations && !conversationsExhausted) {
+                                loadingMoreConversations = true
+                                scope.launch {
+                                    val nextLimit = (conversationRequestLimit + CONVERSATION_PAGE_SIZE).coerceAtMost(MAX_CONVERSATION_LIMIT)
+                                    if (nextLimit <= conversationRequestLimit) {
+                                        conversationsExhausted = true
+                                    } else {
+                                        val sent = syncTransport.requestBootstrapSync(limit = nextLimit)
+                                        if (sent) {
+                                            conversationRequestLimit = nextLimit
+                                        }
+                                    }
+                                    loadingMoreConversations = false
+                                }
+                            }
+                        },
                         onOpenConversation = viewModel::openConversation,
                         onOpenContacts = viewModel::openContacts,
                         onOpenSettings = viewModel::openSettings,
@@ -164,11 +197,32 @@ private fun ConversationsScreen(
     uiState: WearMessagingUiState,
     compactScreen: Boolean,
     actionsEnabled: Boolean,
+    canLoadMore: Boolean,
+    isLoadingMore: Boolean,
+    onLoadMoreConversations: () -> Unit,
     onOpenConversation: (String) -> Unit,
     onOpenContacts: () -> Unit,
     onOpenSettings: () -> Unit,
 ) {
-    WearScreenShell(compactScreen = compactScreen) {
+    val listState = rememberScalingLazyListState()
+    val conversationCount =
+        (uiState.conversationsState as? ConversationsUiState.Success)
+            ?.conversations
+            ?.size ?: 0
+
+    LaunchedEffect(listState, conversationCount, canLoadMore, isLoadingMore) {
+        if (conversationCount == 0 || !canLoadMore) return@LaunchedEffect
+        snapshotFlow { listState.centerItemIndex }
+            .distinctUntilChanged()
+            .filter { centerIndex -> centerIndex >= (conversationCount + LOAD_MORE_TRIGGER_PREFIX_ITEMS - LOAD_MORE_THRESHOLD_ITEMS) }
+            .collect {
+                if (!isLoadingMore) {
+                    onLoadMoreConversations()
+                }
+            }
+    }
+
+    WearScreenShell(compactScreen = compactScreen, listState = listState) {
         item {
             ListHeader { Text("Wessage") }
         }
@@ -234,6 +288,14 @@ private fun ConversationsScreen(
                         compactScreen = compactScreen,
                         onClick = { onOpenConversation(conversation.id) },
                     )
+                }
+                if (isLoadingMore) {
+                    item {
+                        Text(
+                            text = "Loading more…",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
             }
         }
@@ -443,9 +505,9 @@ private fun SettingsScreen(
 @Composable
 private fun WearScreenShell(
     compactScreen: Boolean,
+    listState: ScalingLazyListState = rememberScalingLazyListState(),
     content: ScalingLazyListScope.() -> Unit,
 ) {
-    val listState = rememberScalingLazyListState()
     ScreenScaffold(scrollState = listState) { contentPadding ->
         Box(
             modifier =
@@ -712,3 +774,9 @@ private fun SyncStatus.label(): String =
 
 private fun newMutationId(): String =
     "watch-${System.currentTimeMillis()}-${(1000..9999).random()}"
+
+private const val INITIAL_CONVERSATION_LIMIT = 25
+private const val CONVERSATION_PAGE_SIZE = 20
+private const val MAX_CONVERSATION_LIMIT = 300
+private const val LOAD_MORE_TRIGGER_PREFIX_ITEMS = 3
+private const val LOAD_MORE_THRESHOLD_ITEMS = 4

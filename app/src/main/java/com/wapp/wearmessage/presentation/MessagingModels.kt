@@ -6,6 +6,7 @@ data class Conversation(
     val participants: List<String>,
     val lastMessage: String,
     val lastUpdatedAt: String,
+    val lastUpdatedAtEpochMillis: Long,
     val unreadCount: Int,
     val muted: Boolean = false,
 )
