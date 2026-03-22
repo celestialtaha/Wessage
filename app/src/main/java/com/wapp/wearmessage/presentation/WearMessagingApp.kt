@@ -149,51 +149,6 @@ fun WearMessagingApp(
                                 )
                             }
                         },
-                        onMarkRead = {
-                            viewModel.markConversationRead(activeScreen.conversationId)
-                            scope.launch {
-                                syncTransport.sendWatchMutation(
-                                    WatchMutation(
-                                        clientMutationId = newMutationId(),
-                                        type = WatchMutationType.MARK_READ,
-                                        conversationId = activeScreen.conversationId,
-                                        createdAtEpochMillis = System.currentTimeMillis(),
-                                    )
-                                )
-                            }
-                        },
-                        onMute = {
-                            val type =
-                                if (conversation?.muted == true) {
-                                    WatchMutationType.UNMUTE
-                                } else {
-                                    WatchMutationType.MUTE
-                                }
-                            viewModel.toggleConversationMute(activeScreen.conversationId)
-                            scope.launch {
-                                syncTransport.sendWatchMutation(
-                                    WatchMutation(
-                                        clientMutationId = newMutationId(),
-                                        type = type,
-                                        conversationId = activeScreen.conversationId,
-                                        createdAtEpochMillis = System.currentTimeMillis(),
-                                    )
-                                )
-                            }
-                        },
-                        onArchive = {
-                            viewModel.archiveConversation(activeScreen.conversationId)
-                            scope.launch {
-                                syncTransport.sendWatchMutation(
-                                    WatchMutation(
-                                        clientMutationId = newMutationId(),
-                                        type = WatchMutationType.ARCHIVE,
-                                        conversationId = activeScreen.conversationId,
-                                        createdAtEpochMillis = System.currentTimeMillis(),
-                                    )
-                                )
-                            }
-                        },
                     )
                 }
             }
@@ -332,9 +287,6 @@ private fun ThreadScreen(
     messages: List<Message>,
     actionsEnabled: Boolean,
     onQuickReply: (String) -> Unit,
-    onMarkRead: () -> Unit,
-    onMute: () -> Unit,
-    onArchive: () -> Unit,
 ) {
     val quickReplies = remember { listOf("On my way", "Seen", "Call later") }
     val expandedMessageIds = remember { mutableStateListOf<String>() }
@@ -403,20 +355,6 @@ private fun ThreadScreen(
                         keyboardComposerVisible = true
                     },
                 )
-            }
-        }
-        item { ListSubHeader { Text("Thread actions") } }
-        item {
-            Button(onClick = onMarkRead, enabled = actionsEnabled) { Text("Mark read") }
-        }
-        item {
-            OutlinedButton(onClick = onMute, enabled = actionsEnabled) {
-                Text(if (conversation?.muted == true) "Unmute" else "Mute")
-            }
-        }
-        item {
-            OutlinedButton(onClick = onArchive, enabled = actionsEnabled) {
-                Text("Archive")
             }
         }
     }
