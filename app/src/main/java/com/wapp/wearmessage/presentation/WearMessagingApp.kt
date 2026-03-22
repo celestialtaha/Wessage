@@ -14,11 +14,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -43,14 +46,25 @@ import androidx.wear.compose.material3.RadioButton
 import androidx.wear.compose.material3.ScreenScaffold
 import androidx.wear.compose.material3.SwitchButton
 import androidx.wear.compose.material3.Text
+import com.wapp.wearmessage.sync.WearSyncTransport
+import com.wapp.wearmessage.sync.contract.WatchMutation
+import com.wapp.wearmessage.sync.contract.WatchMutationType
+import kotlinx.coroutines.launch
 
 @Composable
 fun WearMessagingApp(
     viewModel: MessagingViewModel = viewModel(),
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val syncTransport = remember(context) { WearSyncTransport(context) }
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val compactScreen = isCompactRoundScreen()
     val canSwipeBack = uiState.currentScreen != WearScreen.Conversations
+
+    LaunchedEffect(Unit) {
+        syncTransport.requestBootstrapSync()
+    }
 
     AppScaffold {
         BasicSwipeToDismissBox(
@@ -102,10 +116,63 @@ fun WearMessagingApp(
                         actionsEnabled = !isBackground,
                         onQuickReply = { text ->
                             viewModel.queueQuickReply(activeScreen.conversationId, text)
+                            scope.launch {
+                                syncTransport.sendWatchMutation(
+                                    WatchMutation(
+                                        clientMutationId = newMutationId(),
+                                        type = WatchMutationType.REPLY,
+                                        conversationId = activeScreen.conversationId,
+                                        messageBody = text,
+                                        createdAtEpochMillis = System.currentTimeMillis(),
+                                    )
+                                )
+                            }
                         },
-                        onMarkRead = { viewModel.markConversationRead(activeScreen.conversationId) },
-                        onMute = { viewModel.toggleConversationMute(activeScreen.conversationId) },
-                        onArchive = { viewModel.archiveConversation(activeScreen.conversationId) },
+                        onMarkRead = {
+                            viewModel.markConversationRead(activeScreen.conversationId)
+                            scope.launch {
+                                syncTransport.sendWatchMutation(
+                                    WatchMutation(
+                                        clientMutationId = newMutationId(),
+                                        type = WatchMutationType.MARK_READ,
+                                        conversationId = activeScreen.conversationId,
+                                        createdAtEpochMillis = System.currentTimeMillis(),
+                                    )
+                                )
+                            }
+                        },
+                        onMute = {
+                            val type =
+                                if (conversation?.muted == true) {
+                                    WatchMutationType.UNMUTE
+                                } else {
+                                    WatchMutationType.MUTE
+                                }
+                            viewModel.toggleConversationMute(activeScreen.conversationId)
+                            scope.launch {
+                                syncTransport.sendWatchMutation(
+                                    WatchMutation(
+                                        clientMutationId = newMutationId(),
+                                        type = type,
+                                        conversationId = activeScreen.conversationId,
+                                        createdAtEpochMillis = System.currentTimeMillis(),
+                                    )
+                                )
+                            }
+                        },
+                        onArchive = {
+                            viewModel.archiveConversation(activeScreen.conversationId)
+                            scope.launch {
+                                syncTransport.sendWatchMutation(
+                                    WatchMutation(
+                                        clientMutationId = newMutationId(),
+                                        type = WatchMutationType.ARCHIVE,
+                                        conversationId = activeScreen.conversationId,
+                                        createdAtEpochMillis = System.currentTimeMillis(),
+                                    )
+                                )
+                            }
+                        },
                     )
                 }
             }
@@ -498,3 +565,6 @@ private fun SyncStatus.label(): String =
         SyncStatus.Syncing -> "syncing"
         SyncStatus.OfflineQueue -> "queued"
     }
+
+private fun newMutationId(): String =
+    "watch-${System.currentTimeMillis()}-${(1000..9999).random()}"
