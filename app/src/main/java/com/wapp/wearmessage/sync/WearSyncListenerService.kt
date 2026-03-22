@@ -19,10 +19,12 @@ class WearSyncListenerService : WearableListenerService() {
             when (path) {
                 SyncPaths.CONVERSATIONS -> {
                     val delta = SyncJsonCodec.decodeConversationDeltaBatch(payload)
+                    delta?.let { WearSyncBus.emit(SyncInboundEvent.Conversations(it)) }
                     Log.d(TAG, "Conversations delta received: ${delta?.conversations?.size ?: 0}")
                 }
                 SyncPaths.MESSAGES -> {
                     val delta = SyncJsonCodec.decodeMessageDeltaBatch(payload)
+                    delta?.let { WearSyncBus.emit(SyncInboundEvent.Messages(it)) }
                     Log.d(TAG, "Messages delta received: ${delta?.messages?.size ?: 0}")
                 }
             }
@@ -32,6 +34,7 @@ class WearSyncListenerService : WearableListenerService() {
     override fun onMessageReceived(messageEvent: MessageEvent) {
         if (messageEvent.path != SyncPaths.ACK) return
         val ack = SyncJsonCodec.decodeMutationAck(messageEvent.data)
+        ack?.let { WearSyncBus.emit(SyncInboundEvent.Ack(it)) }
         Log.d(
             TAG,
             "Ack received mutation=${ack?.clientMutationId} accepted=${ack?.accepted}",

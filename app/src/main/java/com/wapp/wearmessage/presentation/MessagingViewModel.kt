@@ -2,12 +2,16 @@ package com.wapp.wearmessage.presentation
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.wapp.wearmessage.sync.SyncInboundEvent
+import com.wapp.wearmessage.sync.WearSyncBus
+import com.wapp.wearmessage.sync.contract.SyncMessageStatus
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlin.math.absoluteValue
 
 class MessagingViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(WearMessagingUiState())
@@ -15,6 +19,7 @@ class MessagingViewModel : ViewModel() {
 
     init {
         bootstrapData()
+        observeIncomingSync()
     }
 
     fun openConversations() {
@@ -289,6 +294,97 @@ class MessagingViewModel : ViewModel() {
             }
         }
     }
+
+    private fun observeIncomingSync() {
+        viewModelScope.launch {
+            WearSyncBus.events.collect { event ->
+                when (event) {
+                    is SyncInboundEvent.Conversations -> applyConversationDelta(event.payload)
+                    is SyncInboundEvent.Messages -> applyMessageDelta(event.payload)
+                    is SyncInboundEvent.Ack -> applyMutationAck(event.payload)
+                }
+            }
+        }
+    }
+
+    private fun applyConversationDelta(batch: com.wapp.wearmessage.sync.contract.ConversationDeltaBatch) {
+        _uiState.update { state ->
+            val conversations =
+                batch.conversations
+                    .map { sync ->
+                        sync to
+                            Conversation(
+                                id = sync.id,
+                                title = sync.participants.firstOrNull().orEmpty().ifBlank { "Conversation ${sync.id}" },
+                                participants = sync.participants,
+                                lastMessage = sync.lastMessage,
+                                lastUpdatedAt = sync.lastUpdatedAtEpochMillis.toRelativeTimestampLabel(),
+                                unreadCount = sync.unreadCount,
+                                muted = sync.muted,
+                            )
+                    }
+                    .filterNot { (sync, _) -> batch.deletedConversationIds.contains(sync.id) }
+                    .sortedByDescending { it.first.lastUpdatedAtEpochMillis }
+                    .map { it.second }
+
+            state.copy(
+                conversationsState =
+                    if (conversations.isEmpty()) {
+                        ConversationsUiState.Empty
+                    } else {
+                        ConversationsUiState.Success(conversations)
+                    },
+                syncStatus = SyncStatus.Idle,
+            )
+        }
+    }
+
+    private fun applyMessageDelta(batch: com.wapp.wearmessage.sync.contract.MessageDeltaBatch) {
+        _uiState.update { state ->
+            val groupedMessages = batch.messages.groupBy { it.conversationId }
+            val mappedByConversation =
+                groupedMessages.mapValues { (_, syncMessages) ->
+                    syncMessages
+                        .sortedBy { it.timestampEpochMillis }
+                        .filterNot { sync -> batch.deletedMessageIds.contains(sync.id) }
+                        .map { sync ->
+                            Message(
+                                id = sync.id,
+                                conversationId = sync.conversationId,
+                                senderId = sync.senderId,
+                                senderName = sync.senderId.ifBlank { "Unknown" },
+                                body = sync.body,
+                                timestamp = sync.timestampEpochMillis.toClockLabel(),
+                                status = sync.status.toMessageStatus(),
+                                localVersion = sync.localVersion,
+                                outgoing = sync.senderId == "self",
+                            )
+                        }
+                }
+
+            state.copy(
+                messagesByConversation = state.messagesByConversation + mappedByConversation,
+                syncStatus = SyncStatus.Idle,
+            )
+        }
+    }
+
+    private fun applyMutationAck(ack: com.wapp.wearmessage.sync.contract.MutationAck) {
+        _uiState.update { state ->
+            val pendingAfterAck = (state.pendingMutations - 1).coerceAtLeast(0)
+            state.copy(
+                pendingMutations = pendingAfterAck,
+                syncStatus =
+                    if (!ack.accepted) {
+                        SyncStatus.OfflineQueue
+                    } else if (pendingAfterAck == 0) {
+                        SyncStatus.Idle
+                    } else {
+                        SyncStatus.Syncing
+                    },
+            )
+        }
+    }
 }
 
 private fun ConversationsUiState.withConversationList(
@@ -319,3 +415,28 @@ private fun ConversationsUiState.withUpdatedConversation(
             }
         }
     }
+
+private fun SyncMessageStatus.toMessageStatus(): MessageStatus =
+    when (this) {
+        SyncMessageStatus.PENDING -> MessageStatus.Pending
+        SyncMessageStatus.SENT -> MessageStatus.Sent
+        SyncMessageStatus.DELIVERED -> MessageStatus.Delivered
+        SyncMessageStatus.FAILED -> MessageStatus.Failed
+        SyncMessageStatus.READ -> MessageStatus.Read
+    }
+
+private fun Long.toRelativeTimestampLabel(now: Long = System.currentTimeMillis()): String {
+    val deltaMinutes = ((now - this).coerceAtLeast(0L) / 60_000L).toInt()
+    return when {
+        deltaMinutes < 1 -> "now"
+        deltaMinutes < 60 -> "${deltaMinutes}m"
+        else -> "${(deltaMinutes / 60)}h"
+    }
+}
+
+private fun Long.toClockLabel(): String {
+    val minutes = (this / 60_000L) % (24 * 60)
+    val hour = (minutes / 60).toInt()
+    val minute = (minutes % 60).toInt().absoluteValue
+    return "%02d:%02d".format(hour, minute)
+}
