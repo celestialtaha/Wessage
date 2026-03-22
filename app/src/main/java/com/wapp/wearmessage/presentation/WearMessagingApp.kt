@@ -38,6 +38,7 @@ import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -57,7 +58,9 @@ import androidx.wear.compose.material3.Button
 import androidx.wear.compose.material3.Card
 import androidx.wear.compose.material3.CardDefaults
 import androidx.wear.compose.material3.CircularProgressIndicator
+import androidx.wear.compose.material3.FilledTonalIconButton
 import androidx.wear.compose.material3.FilledTonalButton
+import androidx.wear.compose.material3.Icon
 import androidx.wear.compose.material3.ListHeader
 import androidx.wear.compose.material3.ListSubHeader
 import androidx.wear.compose.material3.MaterialTheme
@@ -326,7 +329,6 @@ private fun ThreadScreen(
         item {
             ListHeader { Text(conversation?.title ?: "Conversation") }
         }
-        item { ListSubHeader { Text("Messages") } }
         if (messages.isEmpty()) {
             item {
                 Text(
@@ -534,26 +536,34 @@ private fun MessageBubble(
             maxLines = if (expanded) Int.MAX_VALUE else if (compactScreen) 2 else 3,
             overflow = if (expanded) TextOverflow.Visible else TextOverflow.Ellipsis,
         )
-        Spacer(modifier = Modifier.height(4.dp))
-        Text(
-            text = "${message.timestamp}  ${message.status.name.lowercase()}",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-        )
-        Spacer(modifier = Modifier.height(2.dp))
-        Text(
-            text = if (expanded) "Tap to collapse" else "Tap to expand",
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-        )
 
         if (expanded && actionsEnabled) {
             Spacer(modifier = Modifier.height(6.dp))
-            Text(
-                text = "Quick actions",
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-            )
-            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                FilledTonalIconButton(
+                    onClick = onKeyboardReply,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(
+                        painter = painterResource(id = android.R.drawable.ic_menu_edit),
+                        contentDescription = "Keyboard input",
+                    )
+                }
+                FilledTonalIconButton(
+                    onClick = onVoiceReply,
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Icon(
+                        painter = painterResource(id = android.R.drawable.ic_btn_speak_now),
+                        contentDescription = "Voice input",
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(6.dp))
             quickReplies.forEach { quickReply ->
                 FilledTonalButton(
                     onClick = { onQuickReply(quickReply) },
@@ -562,19 +572,13 @@ private fun MessageBubble(
                     Text(quickReply)
                 }
             }
-            OutlinedButton(
-                onClick = onKeyboardReply,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Keyboard input")
-            }
-            OutlinedButton(
-                onClick = onVoiceReply,
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text("Voice input")
-            }
         }
+
+        Spacer(modifier = Modifier.height(4.dp))
+        Text(
+            text = "${message.timestamp}  ${message.status.name.lowercase()}",
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
