@@ -7,6 +7,7 @@ import com.google.android.gms.wearable.Wearable
 import com.wapp.wearmessage.sync.contract.SyncJsonCodec
 import com.wapp.wearmessage.sync.contract.SyncPaths
 import com.wapp.wearmessage.sync.contract.WatchMutation
+import com.wapp.wearmessage.sync.security.SecureSyncCodec
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
@@ -16,38 +17,67 @@ class WearSyncTransport(
     private val appContext = context.applicationContext
     private val nodeClient by lazy { Wearable.getNodeClient(appContext) }
     private val messageClient by lazy { Wearable.getMessageClient(appContext) }
+    private val secureCodec by lazy { SecureSyncCodec(appContext) }
 
     suspend fun requestBootstrapSync(): Boolean =
         withContext(Dispatchers.IO) {
-            sendToConnectedNodes(
-                path = SyncPaths.BOOTSTRAP_REQUEST,
-                payload = ByteArray(0),
-            )
+            runCatching {
+                val nodes = Tasks.await(nodeClient.connectedNodes)
+                var sent = false
+                nodes.forEach { node ->
+                    Tasks.await(
+                        messageClient.sendMessage(
+                            node.id,
+                            SyncPaths.KEY_EXCHANGE_REQUEST,
+                            secureCodec.createKeyExchangePayload(),
+                        )
+                    )
+                    Tasks.await(
+                        messageClient.sendMessage(
+                            node.id,
+                            SyncPaths.BOOTSTRAP_REQUEST,
+                            ByteArray(0),
+                        )
+                    )
+                    sent = true
+                }
+                sent
+            }.onFailure { error ->
+                Log.w(TAG, "Failed requesting bootstrap sync", error)
+            }.getOrDefault(false)
         }
 
     suspend fun sendWatchMutation(mutation: WatchMutation): Boolean =
         withContext(Dispatchers.IO) {
-            sendToConnectedNodes(
-                path = SyncPaths.MUTATION,
-                payload = SyncJsonCodec.encodeWatchMutation(mutation),
-            )
+            runCatching {
+                val nodes = Tasks.await(nodeClient.connectedNodes)
+                val plainPayload = SyncJsonCodec.encodeWatchMutation(mutation)
+                var sent = false
+                nodes.forEach { node ->
+                    val encrypted =
+                        secureCodec.encrypt(
+                            nodeId = node.id,
+                            path = SyncPaths.MUTATION,
+                            plainPayload = plainPayload,
+                        )
+                    if (encrypted == null) {
+                        Tasks.await(
+                            messageClient.sendMessage(
+                                node.id,
+                                SyncPaths.KEY_EXCHANGE_REQUEST,
+                                secureCodec.createKeyExchangePayload(),
+                            )
+                        )
+                    } else {
+                        Tasks.await(messageClient.sendMessage(node.id, SyncPaths.MUTATION, encrypted))
+                        sent = true
+                    }
+                }
+                sent
+            }.onFailure { error ->
+                Log.w(TAG, "Failed sending mutation", error)
+            }.getOrDefault(false)
         }
-
-    private fun sendToConnectedNodes(
-        path: String,
-        payload: ByteArray,
-    ): Boolean =
-        runCatching {
-            val nodes = Tasks.await(nodeClient.connectedNodes)
-            var sent = false
-            nodes.forEach { node ->
-                Tasks.await(messageClient.sendMessage(node.id, path, payload))
-                sent = true
-            }
-            sent
-        }.onFailure { error ->
-            Log.w(TAG, "Failed to send path=$path to phone", error)
-        }.getOrDefault(false)
 
     private companion object {
         private const val TAG = "WearSyncTransport"

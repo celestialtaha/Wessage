@@ -9,6 +9,8 @@ object SyncPaths {
     const val MUTATION = "$ROOT/mutation"
     const val ACK = "$ROOT/ack"
     const val BOOTSTRAP_REQUEST = "$ROOT/bootstrap_request"
+    const val KEY_EXCHANGE_REQUEST = "$ROOT/key_exchange/request"
+    const val KEY_EXCHANGE_RESPONSE = "$ROOT/key_exchange/response"
 }
 
 enum class SyncMessageStatus {
