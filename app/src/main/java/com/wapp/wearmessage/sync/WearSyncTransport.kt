@@ -36,13 +36,15 @@ class WearSyncTransport(
                     )
                 var sent = false
                 nodes.forEach { node ->
-                    Tasks.await(
-                        messageClient.sendMessage(
-                            node.id,
-                            SyncPaths.KEY_EXCHANGE_REQUEST,
-                            secureCodec.createKeyExchangePayload(),
+                    if (!secureCodec.hasPeerKey(node.id)) {
+                        Tasks.await(
+                            messageClient.sendMessage(
+                                node.id,
+                                SyncPaths.KEY_EXCHANGE_REQUEST,
+                                secureCodec.createKeyExchangePayload(),
+                            )
                         )
-                    )
+                    }
                     Tasks.await(
                         messageClient.sendMessage(
                             node.id,
@@ -65,6 +67,16 @@ class WearSyncTransport(
                 val plainPayload = SyncJsonCodec.encodeWatchMutation(mutation)
                 var sent = false
                 nodes.forEach { node ->
+                    if (!secureCodec.hasPeerKey(node.id)) {
+                        Tasks.await(
+                            messageClient.sendMessage(
+                                node.id,
+                                SyncPaths.KEY_EXCHANGE_REQUEST,
+                                secureCodec.createKeyExchangePayload(),
+                            )
+                        )
+                        return@forEach
+                    }
                     val encrypted =
                         secureCodec.encrypt(
                             nodeId = node.id,
@@ -79,6 +91,7 @@ class WearSyncTransport(
                                 secureCodec.createKeyExchangePayload(),
                             )
                         )
+                        return@forEach
                     } else {
                         Tasks.await(messageClient.sendMessage(node.id, SyncPaths.MUTATION, encrypted))
                         sent = true

@@ -11,6 +11,7 @@ import com.wapp.wearmessage.sync.SyncInboundEvent
 import com.wapp.wearmessage.sync.WearSyncBus
 import com.wapp.wearmessage.sync.contract.SyncMessageStatus
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -29,6 +30,7 @@ class MessagingViewModel(
     val uiState: StateFlow<WearMessagingUiState> = _uiState.asStateFlow()
     private val secureCache = SecureMessageCache(application.applicationContext)
     private var hasReceivedSyncPayload = false
+    private var persistCacheJob: Job? = null
 
     init {
         bootstrapData()
@@ -309,9 +311,14 @@ class MessagingViewModel(
                 .distinctUntilChanged()
                 .collect { snapshot ->
                     if (snapshot != null) {
-                        withContext(Dispatchers.IO) {
-                            secureCache.save(snapshot)
-                        }
+                        persistCacheJob?.cancel()
+                        persistCacheJob =
+                            viewModelScope.launch {
+                                delay(CACHE_PERSIST_DEBOUNCE_MS)
+                                withContext(Dispatchers.IO) {
+                                    secureCache.save(snapshot)
+                                }
+                            }
                     }
                 }
         }
@@ -363,6 +370,8 @@ class MessagingViewModel(
             val conversations =
                 mergedById.values
                     .sortedByDescending { it.lastUpdatedAtEpochMillis }
+                    .take(MAX_CONVERSATIONS_IN_MEMORY)
+            val retainedConversationIds = conversations.map { it.id }.toSet()
 
             state.copy(
                 conversationsState =
@@ -370,6 +379,10 @@ class MessagingViewModel(
                         ConversationsUiState.Empty
                     } else {
                         ConversationsUiState.Success(conversations)
+                    },
+                messagesByConversation =
+                    state.messagesByConversation.filterKeys { conversationId ->
+                        retainedConversationIds.contains(conversationId)
                     },
                 syncStatus = SyncStatus.Idle,
             )
@@ -399,9 +412,18 @@ class MessagingViewModel(
                             )
                         }
                 }
+            val mergedMessagesByConversation =
+                (state.messagesByConversation + mappedByConversation)
+                    .mapValues { (_, messages) ->
+                        if (messages.size <= MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY) {
+                            messages
+                        } else {
+                            messages.takeLast(MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY)
+                        }
+                    }
 
             state.copy(
-                messagesByConversation = state.messagesByConversation + mappedByConversation,
+                messagesByConversation = mergedMessagesByConversation,
                 syncStatus = SyncStatus.Idle,
             )
         }
@@ -422,6 +444,11 @@ class MessagingViewModel(
                     },
             )
         }
+    }
+
+    override fun onCleared() {
+        persistCacheJob?.cancel()
+        super.onCleared()
     }
 }
 
@@ -490,10 +517,24 @@ private fun WearMessagingUiState.toCachedSyncSnapshotOrNull(): CachedSyncSnapsho
     val messages =
         messagesByConversation
             .values
+            .map { conversationMessages ->
+                if (conversationMessages.size <= MAX_MESSAGES_PER_CONVERSATION_CACHE) {
+                    conversationMessages
+                } else {
+                    conversationMessages.takeLast(MAX_MESSAGES_PER_CONVERSATION_CACHE)
+                }
+            }
             .flatten()
             .sortedWith(
                 compareBy<Message>({ it.conversationId }, { it.id })
             )
+            .let { sortedMessages ->
+                if (sortedMessages.size <= MAX_MESSAGES_TOTAL_CACHE) {
+                    sortedMessages
+                } else {
+                    sortedMessages.takeLast(MAX_MESSAGES_TOTAL_CACHE)
+                }
+            }
             .map { message ->
                 CachedMessage(
                     id = message.id,
@@ -511,7 +552,6 @@ private fun WearMessagingUiState.toCachedSyncSnapshotOrNull(): CachedSyncSnapsho
     return CachedSyncSnapshot(
         conversations = conversations,
         messages = messages,
-        savedAtEpochMillis = System.currentTimeMillis(),
     )
 }
 
@@ -537,3 +577,9 @@ private fun Long.toClockLabel(): String {
     val minute = (minutes % 60).toInt().absoluteValue
     return "%02d:%02d".format(hour, minute)
 }
+
+private const val CACHE_PERSIST_DEBOUNCE_MS = 500L
+private const val MAX_CONVERSATIONS_IN_MEMORY = 300
+private const val MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY = 250
+private const val MAX_MESSAGES_PER_CONVERSATION_CACHE = 120
+private const val MAX_MESSAGES_TOTAL_CACHE = 1500

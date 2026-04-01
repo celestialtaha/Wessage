@@ -7,6 +7,7 @@ import android.util.Base64
 import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
+import java.security.MessageDigest
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -19,16 +20,25 @@ class SecureMessageCache(
     private val prefs by lazy {
         appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     }
+    private val secretKey by lazy { getOrCreateSecretKey() }
+    @Volatile
+    private var lastSavedDigest: String? = prefs.getString(PREF_KEY_CACHE_DIGEST, null)
 
     fun save(snapshot: CachedSyncSnapshot) {
         val plainPayload = snapshot.toJson().toString().toByteArray(Charsets.UTF_8)
+        val digest = plainPayload.sha256B64()
+        if (digest == lastSavedDigest) {
+            return
+        }
         val encryptedPayload = encrypt(plainPayload) ?: return
         prefs.edit()
             .putString(
                 PREF_KEY_CACHE_BLOB,
                 Base64.encodeToString(encryptedPayload, Base64.NO_WRAP),
             )
+            .putString(PREF_KEY_CACHE_DIGEST, digest)
             .apply()
+        lastSavedDigest = digest
     }
 
     fun load(): CachedSyncSnapshot? {
@@ -42,18 +52,23 @@ class SecureMessageCache(
             runCatching { JSONObject(String(plainPayload, Charsets.UTF_8)) }
                 .getOrNull()
                 ?: return clearAndNull()
+        lastSavedDigest = prefs.getString(PREF_KEY_CACHE_DIGEST, null)
         return CachedSyncSnapshot.fromJson(json) ?: clearAndNull()
     }
 
     private fun clearAndNull(): CachedSyncSnapshot? {
-        prefs.edit().remove(PREF_KEY_CACHE_BLOB).apply()
+        prefs.edit()
+            .remove(PREF_KEY_CACHE_BLOB)
+            .remove(PREF_KEY_CACHE_DIGEST)
+            .apply()
+        lastSavedDigest = null
         return null
     }
 
     private fun encrypt(plain: ByteArray): ByteArray? =
         runCatching {
             val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(Cipher.ENCRYPT_MODE, getOrCreateSecretKey())
+            cipher.init(Cipher.ENCRYPT_MODE, secretKey)
             val iv = cipher.iv ?: return null
             val encrypted = cipher.doFinal(plain)
             ByteBuffer.allocate(1 + iv.size + encrypted.size)
@@ -74,7 +89,7 @@ class SecureMessageCache(
             val encrypted = ByteArray(payloadBuffer.remaining())
             payloadBuffer.get(encrypted)
             val cipher = Cipher.getInstance(TRANSFORMATION)
-            cipher.init(Cipher.DECRYPT_MODE, getOrCreateSecretKey(), javax.crypto.spec.GCMParameterSpec(TAG_SIZE_BITS, iv))
+            cipher.init(Cipher.DECRYPT_MODE, secretKey, javax.crypto.spec.GCMParameterSpec(TAG_SIZE_BITS, iv))
             cipher.doFinal(encrypted)
         }.getOrNull()
 
@@ -105,6 +120,7 @@ class SecureMessageCache(
     companion object {
         private const val PREFS_NAME = "wessage_secure_message_cache"
         private const val PREF_KEY_CACHE_BLOB = "cache_blob_v1"
+        private const val PREF_KEY_CACHE_DIGEST = "cache_blob_digest_v1"
         private const val KEY_ALIAS = "wessage.message.cache.key.v1"
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val TRANSFORMATION = "AES/GCM/NoPadding"
@@ -115,12 +131,11 @@ class SecureMessageCache(
 data class CachedSyncSnapshot(
     val conversations: List<CachedConversation>,
     val messages: List<CachedMessage>,
-    val savedAtEpochMillis: Long,
 ) {
     fun toJson(): JSONObject =
         JSONObject()
             .put("schemaVersion", SCHEMA_VERSION)
-            .put("savedAtEpochMillis", savedAtEpochMillis)
+            .put("savedAtEpochMillis", System.currentTimeMillis())
             .put(
                 "conversations",
                 JSONArray().apply {
@@ -207,7 +222,6 @@ data class CachedSyncSnapshot(
             return CachedSyncSnapshot(
                 conversations = conversations,
                 messages = messages,
-                savedAtEpochMillis = json.optLong("savedAtEpochMillis", 0L),
             )
         }
     }
@@ -241,3 +255,8 @@ private fun JSONArray.toStringList(): List<String> =
             add(optString(index))
         }
     }
+
+private fun ByteArray.sha256B64(): String {
+    val digest = MessageDigest.getInstance("SHA-256").digest(this)
+    return Base64.encodeToString(digest, Base64.NO_WRAP)
+}
