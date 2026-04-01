@@ -8,37 +8,50 @@ on:
 permissions:
   contents: write
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   release:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
       - name: Validate Gradle Wrapper
-        uses: gradle/actions/wrapper-validation@v4
+        uses: gradle/actions/wrapper-validation@v5
 
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: "21"
 
       - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v5
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android SDK packages
         run: |
           yes | sdkmanager --licenses || true
-          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" "build-tools;29.0.3"
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
       - name: Build APKs
         run: ./gradlew :app:assembleDebug :app:assembleRelease
+
+      - name: Detect release APK paths
+        id: detect
+        run: |
+          if [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
+            echo "unsigned_exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "unsigned_exists=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Check signing secrets availability
         id: signing_ready
@@ -56,30 +69,81 @@ jobs:
 
       - name: Sign release APK (optional)
         id: sign_release
-        if: steps.signing_ready.outputs.enabled == 'true'
-        uses: r0adkll/sign-android-release@v1
-        with:
-          releaseDirectory: app/build/outputs/apk/release
-          signingKeyBase64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
-          alias: ${{ secrets.ANDROID_ALIAS }}
-          keyStorePassword: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-          keyPassword: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        if: steps.detect.outputs.unsigned_exists == 'true' && steps.signing_ready.outputs.enabled == 'true'
         env:
-          BUILD_TOOLS_VERSION: "36.0.0"
+          KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
+          KEY_ALIAS: ${{ secrets.ANDROID_ALIAS }}
+          STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+          ALIGNED_APK="app/build/outputs/apk/release/app-release-aligned.apk"
+          SIGNED_APK="app/build/outputs/apk/release/app-release-signed.apk"
+          KEYSTORE_PATH="$RUNNER_TEMP/release-keystore.jks"
+          ZIPALIGN="${ANDROID_SDK_ROOT}/build-tools/36.0.0/zipalign"
+          APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
+
+          SANITIZED_KEY="${KEY_B64#data:*;base64,}"
+          SANITIZED_KEY="$(printf '%s' "$SANITIZED_KEY" | tr -d '\r\n\t ')"
+
+          if [ -z "$SANITIZED_KEY" ]; then
+            echo "ANDROID_SIGNING_KEY_BASE64 is empty after sanitization."
+            exit 1
+          fi
+
+          if ! printf '%s' "$SANITIZED_KEY" | base64 --decode > "$KEYSTORE_PATH" 2>/dev/null; then
+            if ! printf '%s' "$SANITIZED_KEY" | openssl base64 -d -A > "$KEYSTORE_PATH" 2>/dev/null; then
+              echo "Invalid ANDROID_SIGNING_KEY_BASE64 secret. Recreate it from your .jks file as a single-line base64 string."
+              exit 1
+            fi
+          fi
+
+          if ! keytool -list -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASS" >/dev/null 2>&1; then
+            echo "Keystore decode succeeded but keystore/password validation failed."
+            exit 1
+          fi
+
+          if ! keytool -list -keystore "$KEYSTORE_PATH" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+            echo "Key alias '$KEY_ALIAS' not found in keystore."
+            exit 1
+          fi
+
+          "$ZIPALIGN" -f -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
+          "$APKSIGNER" sign \
+            --ks "$KEYSTORE_PATH" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --ks-pass "pass:${STORE_PASS}" \
+            --key-pass "pass:${KEY_PASS}" \
+            --out "$SIGNED_APK" \
+            "$ALIGNED_APK"
+          "$APKSIGNER" verify "$SIGNED_APK"
+
+          rm -f "$KEYSTORE_PATH"
+          echo "signed_release_file=$SIGNED_APK" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release assets
         run: |
           set -euo pipefail
           mkdir -p dist
-          cp app/build/outputs/apk/debug/app-debug.apk dist/app-debug.apk
-          if [ -n "${{ steps.sign_release.outputs.signedReleaseFile }}" ] && [ -f "${{ steps.sign_release.outputs.signedReleaseFile }}" ]; then
-            cp "${{ steps.sign_release.outputs.signedReleaseFile }}" dist/app-release-signed.apk
+          cp app/build/outputs/apk/debug/app-debug.apk dist/wessage-debug.apk
+          if [ -n "${{ steps.sign_release.outputs.signed_release_file }}" ] && [ -f "${{ steps.sign_release.outputs.signed_release_file }}" ]; then
+            cp "${{ steps.sign_release.outputs.signed_release_file }}" dist/wessage-release-signed.apk
+          elif [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+            cp app/build/outputs/apk/release/app-release.apk dist/wessage-release.apk
           elif [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
-            cp app/build/outputs/apk/release/app-release-unsigned.apk dist/app-release-unsigned.apk
+            cp app/build/outputs/apk/release/app-release-unsigned.apk dist/wessage-release-unsigned.apk
           fi
           (cd dist && sha256sum *.apk > SHA256SUMS.txt)
 
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wessage-release-assets
+          path: dist/
+
       - name: Generate release notes (git-cliff)
+        id: git_cliff
         uses: orhun/git-cliff-action@v4
         with:
           config: cliff.toml
