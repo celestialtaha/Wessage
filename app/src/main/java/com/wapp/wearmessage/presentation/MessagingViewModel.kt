@@ -21,6 +21,10 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.util.LinkedHashMap
 import kotlin.math.absoluteValue
 
 class MessagingViewModel(
@@ -392,35 +396,57 @@ class MessagingViewModel(
     private fun applyMessageDelta(batch: com.wapp.wearmessage.sync.contract.MessageDeltaBatch) {
         hasReceivedSyncPayload = true
         _uiState.update { state ->
+            val deletedMessageIds = batch.deletedMessageIds.toHashSet()
             val groupedMessages = batch.messages.groupBy { it.conversationId }
-            val mappedByConversation =
-                groupedMessages.mapValues { (_, syncMessages) ->
-                    syncMessages
-                        .sortedBy { it.timestampEpochMillis }
-                        .filterNot { sync -> batch.deletedMessageIds.contains(sync.id) }
-                        .map { sync ->
-                            Message(
-                                id = sync.id,
-                                conversationId = sync.conversationId,
-                                senderId = sync.senderId,
-                                senderName = sync.senderId.ifBlank { "Unknown" },
-                                body = sync.body,
-                                timestamp = sync.timestampEpochMillis.toClockLabel(),
-                                status = sync.status.toMessageStatus(),
-                                localVersion = sync.localVersion,
-                                outgoing = sync.senderId == "self",
-                            )
+            val baseMessagesByConversation =
+                state.messagesByConversation
+                    .mapValues { (_, existingMessages) ->
+                        existingMessages.filterNot { message ->
+                            deletedMessageIds.contains(message.id)
                         }
-                }
+                    }
+                    .toMutableMap()
+
+            groupedMessages.forEach { (conversationId, syncMessages) ->
+                val mergedById =
+                    LinkedHashMap<String, Message>().apply {
+                        baseMessagesByConversation[conversationId]
+                            .orEmpty()
+                            .forEach { message ->
+                                put(message.id, message)
+                            }
+                    }
+                syncMessages
+                    .sortedBy { it.timestampEpochMillis }
+                    .forEach { sync ->
+                        if (!deletedMessageIds.contains(sync.id)) {
+                            mergedById[sync.id] =
+                                Message(
+                                    id = sync.id,
+                                    conversationId = sync.conversationId,
+                                    senderId = sync.senderId,
+                                    senderName = sync.senderId.ifBlank { "Unknown" },
+                                    body = sync.body,
+                                    timestamp = sync.timestampEpochMillis.toClockLabel(),
+                                    status = sync.status.toMessageStatus(),
+                                    localVersion = sync.localVersion,
+                                    outgoing = sync.senderId == "self",
+                                )
+                        }
+                    }
+                baseMessagesByConversation[conversationId] = mergedById.values.toList()
+            }
+
             val mergedMessagesByConversation =
-                (state.messagesByConversation + mappedByConversation)
+                baseMessagesByConversation
+                    .filterValues { messages -> messages.isNotEmpty() }
                     .mapValues { (_, messages) ->
                         if (messages.size <= MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY) {
                             messages
                         } else {
                             messages.takeLast(MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY)
                         }
-                    }
+                }
 
             state.copy(
                 messagesByConversation = mergedMessagesByConversation,
@@ -572,10 +598,16 @@ private fun Long.toRelativeTimestampLabel(now: Long = System.currentTimeMillis()
 }
 
 private fun Long.toClockLabel(): String {
-    val minutes = (this / 60_000L) % (24 * 60)
-    val hour = (minutes / 60).toInt()
-    val minute = (minutes % 60).toInt().absoluteValue
-    return "%02d:%02d".format(hour, minute)
+    return runCatching {
+        Instant.ofEpochMilli(this)
+            .atZone(ZoneId.systemDefault())
+            .format(CLOCK_FORMATTER)
+    }.getOrElse {
+        val minutes = (this / 60_000L) % (24 * 60)
+        val hour = (minutes / 60).toInt()
+        val minute = (minutes % 60).toInt().absoluteValue
+        "%02d:%02d".format(hour, minute)
+    }
 }
 
 private const val CACHE_PERSIST_DEBOUNCE_MS = 500L
@@ -583,3 +615,4 @@ private const val MAX_CONVERSATIONS_IN_MEMORY = 300
 private const val MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY = 250
 private const val MAX_MESSAGES_PER_CONVERSATION_CACHE = 120
 private const val MAX_MESSAGES_TOTAL_CACHE = 1500
+private val CLOCK_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
