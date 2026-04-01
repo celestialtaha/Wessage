@@ -1,26 +1,39 @@
 package com.wapp.wearmessage.presentation
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.wapp.wearmessage.storage.CachedConversation
+import com.wapp.wearmessage.storage.CachedMessage
+import com.wapp.wearmessage.storage.CachedSyncSnapshot
+import com.wapp.wearmessage.storage.SecureMessageCache
 import com.wapp.wearmessage.sync.SyncInboundEvent
 import com.wapp.wearmessage.sync.WearSyncBus
 import com.wapp.wearmessage.sync.contract.SyncMessageStatus
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlin.math.absoluteValue
 
-class MessagingViewModel : ViewModel() {
+class MessagingViewModel(
+    application: Application,
+) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(WearMessagingUiState())
     val uiState: StateFlow<WearMessagingUiState> = _uiState.asStateFlow()
+    private val secureCache = SecureMessageCache(application.applicationContext)
     private var hasReceivedSyncPayload = false
 
     init {
         bootstrapData()
         observeIncomingSync()
+        observeCachePersistence()
     }
 
     fun openConversations() {
@@ -200,12 +213,17 @@ class MessagingViewModel : ViewModel() {
 
     private fun bootstrapData() {
         viewModelScope.launch {
+            val restoredFromCache = restoreCachedData()
             _uiState.update {
-                it.copy(
-                    conversationsState = ConversationsUiState.Loading,
-                    syncStatus = SyncStatus.Syncing,
-                    messagesByConversation = emptyMap(),
-                )
+                if (restoredFromCache) {
+                    it.copy(syncStatus = SyncStatus.Syncing)
+                } else {
+                    it.copy(
+                        conversationsState = ConversationsUiState.Loading,
+                        syncStatus = SyncStatus.Syncing,
+                        messagesByConversation = emptyMap(),
+                    )
+                }
             }
             delay(2_000)
             if (!hasReceivedSyncPayload) {
@@ -216,10 +234,86 @@ class MessagingViewModel : ViewModel() {
                             syncStatus = SyncStatus.Idle,
                         )
                     } else {
-                        state
+                        state.copy(
+                            syncStatus =
+                                if (state.pendingMutations > 0) {
+                                    SyncStatus.OfflineQueue
+                                } else {
+                                    SyncStatus.Idle
+                                }
+                        )
                     }
                 }
             }
+        }
+    }
+
+    private suspend fun restoreCachedData(): Boolean {
+        val snapshot =
+            withContext(Dispatchers.IO) {
+                secureCache.load()
+            } ?: return false
+        _uiState.update {
+            val conversations =
+                snapshot.conversations
+                    .map { cached ->
+                        Conversation(
+                            id = cached.id,
+                            title = cached.title,
+                            participants = cached.participants,
+                            lastMessage = cached.lastMessage,
+                            lastUpdatedAt = cached.lastUpdatedAtEpochMillis.toRelativeTimestampLabel(),
+                            lastUpdatedAtEpochMillis = cached.lastUpdatedAtEpochMillis,
+                            unreadCount = cached.unreadCount,
+                            muted = cached.muted,
+                        )
+                    }
+                    .sortedByDescending { conversation -> conversation.lastUpdatedAtEpochMillis }
+            val messagesByConversation =
+                snapshot.messages
+                    .groupBy { cached -> cached.conversationId }
+                    .mapValues { (_, cachedMessages) ->
+                        cachedMessages.map { cached ->
+                            Message(
+                                id = cached.id,
+                                conversationId = cached.conversationId,
+                                senderId = cached.senderId,
+                                senderName = cached.senderName,
+                                body = cached.body,
+                                timestamp = cached.timestamp,
+                                status = cached.status.toMessageStatusSafe(),
+                                localVersion = cached.localVersion,
+                                outgoing = cached.outgoing,
+                            )
+                        }
+                    }
+
+            it.copy(
+                conversationsState =
+                    if (conversations.isEmpty()) {
+                        ConversationsUiState.Empty
+                    } else {
+                        ConversationsUiState.Success(conversations)
+                    },
+                messagesByConversation = messagesByConversation,
+                syncStatus = SyncStatus.Idle,
+            )
+        }
+        return snapshot.conversations.isNotEmpty() || snapshot.messages.isNotEmpty()
+    }
+
+    private fun observeCachePersistence() {
+        viewModelScope.launch {
+            uiState
+                .map { state -> state.toCachedSyncSnapshotOrNull() }
+                .distinctUntilChanged()
+                .collect { snapshot ->
+                    if (snapshot != null) {
+                        withContext(Dispatchers.IO) {
+                            secureCache.save(snapshot)
+                        }
+                    }
+                }
         }
     }
 
@@ -368,6 +462,58 @@ private fun SyncMessageStatus.toMessageStatus(): MessageStatus =
         SyncMessageStatus.FAILED -> MessageStatus.Failed
         SyncMessageStatus.READ -> MessageStatus.Read
     }
+
+private fun String.toMessageStatusSafe(): MessageStatus =
+    runCatching { MessageStatus.valueOf(this) }
+        .getOrDefault(MessageStatus.Sent)
+
+private fun WearMessagingUiState.toCachedSyncSnapshotOrNull(): CachedSyncSnapshot? {
+    if (conversationsState is ConversationsUiState.Loading) {
+        return null
+    }
+    val conversations =
+        (conversationsState as? ConversationsUiState.Success)
+            ?.conversations
+            .orEmpty()
+            .sortedByDescending { conversation -> conversation.lastUpdatedAtEpochMillis }
+            .map { conversation ->
+                CachedConversation(
+                    id = conversation.id,
+                    title = conversation.title,
+                    participants = conversation.participants,
+                    lastMessage = conversation.lastMessage,
+                    lastUpdatedAtEpochMillis = conversation.lastUpdatedAtEpochMillis,
+                    unreadCount = conversation.unreadCount,
+                    muted = conversation.muted,
+                )
+            }
+    val messages =
+        messagesByConversation
+            .values
+            .flatten()
+            .sortedWith(
+                compareBy<Message>({ it.conversationId }, { it.id })
+            )
+            .map { message ->
+                CachedMessage(
+                    id = message.id,
+                    conversationId = message.conversationId,
+                    senderId = message.senderId,
+                    senderName = message.senderName,
+                    body = message.body,
+                    timestamp = message.timestamp,
+                    status = message.status.name,
+                    localVersion = message.localVersion,
+                    outgoing = message.outgoing,
+                )
+            }
+
+    return CachedSyncSnapshot(
+        conversations = conversations,
+        messages = messages,
+        savedAtEpochMillis = System.currentTimeMillis(),
+    )
+}
 
 private fun Long.toRelativeTimestampLabel(now: Long = System.currentTimeMillis()): String {
     val deltaMillis = (now - this).coerceAtLeast(0L)
