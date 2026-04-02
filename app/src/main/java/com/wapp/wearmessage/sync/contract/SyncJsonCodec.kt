@@ -94,6 +94,7 @@ object SyncJsonCodec {
                 timestampEpochMillis = item.optLong("timestampEpochMillis"),
                 status = statusName.toSyncStatus(),
                 localVersion = item.optInt("localVersion", 1),
+                outgoing = if (item.has("outgoing")) item.optBoolean("outgoing") else null,
             )
         }
     }

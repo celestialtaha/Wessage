@@ -1,6 +1,12 @@
 package com.wapp.wearmessage.presentation
 
+import android.Manifest
 import android.app.Application
+import android.content.pm.PackageManager
+import android.net.Uri
+import android.provider.ContactsContract
+import android.util.Log
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.wapp.wearmessage.storage.CachedConversation
@@ -27,16 +33,22 @@ import java.time.format.DateTimeFormatter
 import java.util.LinkedHashMap
 import kotlin.math.absoluteValue
 
+private val contactNameByNormalizedNumber = mutableMapOf<String, String>()
+
 class MessagingViewModel(
     application: Application,
 ) : AndroidViewModel(application) {
     private val _uiState = MutableStateFlow(WearMessagingUiState())
     val uiState: StateFlow<WearMessagingUiState> = _uiState.asStateFlow()
     private val secureCache = SecureMessageCache(application.applicationContext)
+    private val settingsStore = SettingsStore(application.applicationContext)
     private var hasReceivedSyncPayload = false
     private var persistCacheJob: Job? = null
+    private var syncTimeoutJob: Job? = null
+    private var syncRequestTicket: Long = 0L
 
     init {
+        restoreSettings()
         bootstrapData()
         observeIncomingSync()
         observeCachePersistence()
@@ -51,12 +63,72 @@ class MessagingViewModel(
         }
     }
 
-    fun openContacts() {
-        _uiState.update { it.copy(currentScreen = WearScreen.Contacts) }
-    }
-
     fun openSettings() {
         _uiState.update { it.copy(currentScreen = WearScreen.Settings) }
+    }
+
+    fun openCompose() {
+        _uiState.update { it.copy(currentScreen = WearScreen.Compose) }
+    }
+
+    fun openOrCreateConversationForContact(
+        displayName: String,
+        phoneNumber: String?,
+    ) {
+        val sanitizedName = displayName.trim().ifBlank { "New conversation" }
+        val normalizedPhone = phoneNumber?.normalizedPhoneNumber()?.ifBlank { null }
+        val existingConversationId =
+            (_uiState.value.conversationsState as? ConversationsUiState.Success)
+                ?.conversations
+                ?.firstOrNull { conversation ->
+                    conversation.matchesRecipient(
+                        displayName = sanitizedName,
+                        normalizedPhone = normalizedPhone,
+                    )
+                }
+                ?.id
+
+        if (existingConversationId != null) {
+            openConversation(existingConversationId)
+            return
+        }
+
+        val now = System.currentTimeMillis()
+        val draftConversationId = buildDraftConversationId(sanitizedName, normalizedPhone)
+        _uiState.update { state ->
+            val existingConversations =
+                (state.conversationsState as? ConversationsUiState.Success)
+                    ?.conversations
+                    .orEmpty()
+            val participants =
+                buildList {
+                    add(sanitizedName)
+                    if (normalizedPhone != null) {
+                        add(normalizedPhone)
+                    }
+                }
+            val draftConversation =
+                Conversation(
+                    id = draftConversationId,
+                    title = sanitizedName,
+                    participants = participants,
+                    lastMessage = "New draft",
+                    lastUpdatedAt = now.toRelativeTimestampLabel(now = now),
+                    lastUpdatedAtEpochMillis = now,
+                    unreadCount = 0,
+                )
+            val updatedConversations =
+                (existingConversations.filterNot { it.id == draftConversationId } + draftConversation)
+                    .sortedByDescending { conversation -> conversation.lastUpdatedAtEpochMillis }
+                    .take(MAX_CONVERSATIONS_IN_MEMORY)
+            state.copy(
+                currentScreen = WearScreen.Thread(draftConversationId),
+                selectedConversationId = draftConversationId,
+                conversationsState = ConversationsUiState.Success(updatedConversations),
+                messagesByConversation =
+                    state.messagesByConversation + (draftConversationId to state.messagesByConversation[draftConversationId].orEmpty()),
+            )
+        }
     }
 
     fun openConversation(conversationId: String) {
@@ -192,21 +264,24 @@ class MessagingViewModel(
     }
 
     fun toggleHaptics(enabled: Boolean) {
-        _uiState.update { it.copy(settings = it.settings.copy(hapticsEnabled = enabled)) }
+        updateSettings { it.copy(hapticsEnabled = enabled) }
     }
 
     fun toggleMarkReadOnOpen(enabled: Boolean) {
-        _uiState.update { it.copy(settings = it.settings.copy(markReadOnOpen = enabled)) }
+        updateSettings { it.copy(markReadOnOpen = enabled) }
     }
 
     fun toggleGlassBoost(enabled: Boolean) {
-        _uiState.update { it.copy(settings = it.settings.copy(glassBoostEnabled = enabled)) }
+        updateSettings { it.copy(glassBoostEnabled = enabled) }
     }
 
     fun setSyncProfile(syncProfile: SyncProfile) {
+        var updatedSettings: SettingsUiState? = null
         _uiState.update { state ->
+            val newSettings = state.settings.copy(syncProfile = syncProfile)
+            updatedSettings = newSettings
             state.copy(
-                settings = state.settings.copy(syncProfile = syncProfile),
+                settings = newSettings,
                 syncStatus =
                     if (syncProfile == SyncProfile.BatterySaver) {
                         SyncStatus.Idle
@@ -215,6 +290,19 @@ class MessagingViewModel(
                     },
             )
         }
+        updatedSettings?.let(::persistSettingsAsync)
+    }
+
+    fun markSyncRequested() {
+        syncRequestTicket += 1
+        val ticket = syncRequestTicket
+        _uiState.update { state -> state.copy(syncStatus = SyncStatus.Syncing) }
+        scheduleSyncTimeout(ticket)
+    }
+
+    fun markSyncRequestFailed() {
+        syncTimeoutJob?.cancel()
+        _uiState.update { state -> state.copy(syncStatus = SyncStatus.OfflineQueue) }
     }
 
     private fun bootstrapData() {
@@ -237,12 +325,19 @@ class MessagingViewModel(
                     if (state.conversationsState is ConversationsUiState.Loading) {
                         state.copy(
                             conversationsState = ConversationsUiState.Empty,
-                            syncStatus = SyncStatus.Idle,
+                            syncStatus =
+                                if (state.syncStatus == SyncStatus.OfflineQueue) {
+                                    SyncStatus.OfflineQueue
+                                } else {
+                                    SyncStatus.Idle
+                                },
                         )
                     } else {
                         state.copy(
                             syncStatus =
-                                if (state.pendingMutations > 0) {
+                                if (state.syncStatus == SyncStatus.OfflineQueue) {
+                                    SyncStatus.OfflineQueue
+                                } else if (state.pendingMutations > 0) {
                                     SyncStatus.OfflineQueue
                                 } else {
                                     SyncStatus.Idle
@@ -265,7 +360,12 @@ class MessagingViewModel(
                     .map { cached ->
                         Conversation(
                             id = cached.id,
-                            title = cached.title,
+                            title =
+                                resolveConversationTitle(
+                                    participants = cached.participants,
+                                    fallbackTitle = cached.title,
+                                    fallbackConversationId = cached.id,
+                                ),
                             participants = cached.participants,
                             lastMessage = cached.lastMessage,
                             lastUpdatedAt = cached.lastUpdatedAtEpochMillis.toRelativeTimestampLabel(),
@@ -308,6 +408,31 @@ class MessagingViewModel(
         return snapshot.conversations.isNotEmpty() || snapshot.messages.isNotEmpty()
     }
 
+    private fun restoreSettings() {
+        val persistedSettings = settingsStore.load()
+        _uiState.update { state -> state.copy(settings = persistedSettings) }
+    }
+
+    private fun updateSettings(
+        transform: (SettingsUiState) -> SettingsUiState,
+    ) {
+        var updatedSettings: SettingsUiState? = null
+        _uiState.update { state ->
+            val newSettings = transform(state.settings)
+            if (newSettings != state.settings) {
+                updatedSettings = newSettings
+            }
+            state.copy(settings = newSettings)
+        }
+        updatedSettings?.let(::persistSettingsAsync)
+    }
+
+    private fun persistSettingsAsync(settings: SettingsUiState) {
+        viewModelScope.launch(Dispatchers.IO) {
+            settingsStore.save(settings)
+        }
+    }
+
     private fun observeCachePersistence() {
         viewModelScope.launch {
             uiState
@@ -320,7 +445,11 @@ class MessagingViewModel(
                             viewModelScope.launch {
                                 delay(CACHE_PERSIST_DEBOUNCE_MS)
                                 withContext(Dispatchers.IO) {
-                                    secureCache.save(snapshot)
+                                    runCatching {
+                                        secureCache.save(snapshot)
+                                    }.onFailure { error ->
+                                        Log.w(TAG, "Failed to persist encrypted cache snapshot", error)
+                                    }
                                 }
                             }
                     }
@@ -342,6 +471,7 @@ class MessagingViewModel(
 
     private fun applyConversationDelta(batch: com.wapp.wearmessage.sync.contract.ConversationDeltaBatch) {
         hasReceivedSyncPayload = true
+        syncTimeoutJob?.cancel()
         _uiState.update { state ->
             val mergedById =
                 mutableMapOf<String, Conversation>().apply {
@@ -361,7 +491,12 @@ class MessagingViewModel(
                 mergedById[sync.id] =
                     Conversation(
                         id = sync.id,
-                        title = sync.participants.firstOrNull().orEmpty().ifBlank { "Conversation ${sync.id}" },
+                        title =
+                            resolveConversationTitle(
+                                participants = sync.participants,
+                                fallbackTitle = null,
+                                fallbackConversationId = sync.id,
+                            ),
                         participants = sync.participants,
                         lastMessage = sync.lastMessage,
                         lastUpdatedAt = sync.lastUpdatedAtEpochMillis.toRelativeTimestampLabel(),
@@ -395,9 +530,15 @@ class MessagingViewModel(
 
     private fun applyMessageDelta(batch: com.wapp.wearmessage.sync.contract.MessageDeltaBatch) {
         hasReceivedSyncPayload = true
+        syncTimeoutJob?.cancel()
         _uiState.update { state ->
             val deletedMessageIds = batch.deletedMessageIds.toHashSet()
             val groupedMessages = batch.messages.groupBy { it.conversationId }
+            val participantsByConversationId =
+                (state.conversationsState as? ConversationsUiState.Success)
+                    ?.conversations
+                    ?.associate { conversation -> conversation.id to conversation.participants }
+                    .orEmpty()
             val baseMessagesByConversation =
                 state.messagesByConversation
                     .mapValues { (_, existingMessages) ->
@@ -420,17 +561,25 @@ class MessagingViewModel(
                     .sortedBy { it.timestampEpochMillis }
                     .forEach { sync ->
                         if (!deletedMessageIds.contains(sync.id)) {
+                            val participants =
+                                participantsByConversationId[sync.conversationId].orEmpty()
+                            val isOutgoing = inferOutgoing(sync, participants)
                             mergedById[sync.id] =
                                 Message(
                                     id = sync.id,
                                     conversationId = sync.conversationId,
                                     senderId = sync.senderId,
-                                    senderName = sync.senderId.ifBlank { "Unknown" },
+                                    senderName =
+                                        if (isOutgoing) {
+                                            "You"
+                                        } else {
+                                            resolveParticipantLabel(sync.senderId).ifBlank { "Unknown" }
+                                        },
                                     body = sync.body,
                                     timestamp = sync.timestampEpochMillis.toClockLabel(),
                                     status = sync.status.toMessageStatus(),
                                     localVersion = sync.localVersion,
-                                    outgoing = sync.senderId == "self",
+                                    outgoing = isOutgoing,
                                 )
                         }
                     }
@@ -456,6 +605,7 @@ class MessagingViewModel(
     }
 
     private fun applyMutationAck(ack: com.wapp.wearmessage.sync.contract.MutationAck) {
+        syncTimeoutJob?.cancel()
         _uiState.update { state ->
             val pendingAfterAck = (state.pendingMutations - 1).coerceAtLeast(0)
             state.copy(
@@ -474,7 +624,25 @@ class MessagingViewModel(
 
     override fun onCleared() {
         persistCacheJob?.cancel()
+        syncTimeoutJob?.cancel()
         super.onCleared()
+    }
+
+    private fun scheduleSyncTimeout(ticket: Long) {
+        syncTimeoutJob?.cancel()
+        syncTimeoutJob =
+            viewModelScope.launch {
+                delay(SYNC_REQUEST_TIMEOUT_MS)
+                _uiState.update { state ->
+                    if (ticket != syncRequestTicket) {
+                        state
+                    } else if (state.syncStatus != SyncStatus.Syncing) {
+                        state
+                    } else {
+                        state.copy(syncStatus = SyncStatus.OfflineQueue)
+                    }
+                }
+            }
     }
 }
 
@@ -506,6 +674,152 @@ private fun ConversationsUiState.withUpdatedConversation(
             }
         }
     }
+
+private fun Conversation.matchesRecipient(
+    displayName: String,
+    normalizedPhone: String?,
+): Boolean {
+    if (title.equals(displayName, ignoreCase = true)) {
+        return true
+    }
+    if (participants.any { participant -> participant.equals(displayName, ignoreCase = true) }) {
+        return true
+    }
+    if (normalizedPhone != null) {
+        return participants.any { participant ->
+            participant.normalizedPhoneNumber() == normalizedPhone
+        }
+    }
+    return false
+}
+
+private fun buildDraftConversationId(
+    displayName: String,
+    normalizedPhone: String?,
+): String {
+    val idSource =
+        normalizedPhone
+            ?: displayName.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-')
+    val normalizedSource = idSource.ifBlank { "contact" }
+    return "$DRAFT_CONVERSATION_PREFIX$normalizedSource"
+}
+
+private fun String.normalizedPhoneNumber(): String {
+    val normalized = trim().filter { character -> character.isDigit() || character == '+' }
+    return normalized
+}
+
+private fun MessagingViewModel.resolveConversationTitle(
+    participants: List<String>,
+    fallbackTitle: String?,
+    fallbackConversationId: String,
+): String {
+    val mappedParticipants =
+        participants
+            .map { participant -> resolveParticipantLabel(participant) }
+            .map { participant -> participant.trim() }
+            .filter { participant -> participant.isNotEmpty() }
+            .distinct()
+    if (mappedParticipants.isEmpty()) {
+        return fallbackTitle?.trim().orEmpty().ifBlank { "Conversation $fallbackConversationId" }
+    }
+    if (mappedParticipants.size == 1) {
+        return mappedParticipants.first()
+    }
+    return "${mappedParticipants.first()} +${mappedParticipants.size - 1}"
+}
+
+private fun MessagingViewModel.resolveParticipantLabel(rawValue: String): String {
+    val value = rawValue.trim()
+    if (value.isEmpty()) {
+        return ""
+    }
+    if (!value.looksLikePhoneNumber()) {
+        return value
+    }
+    val normalized = value.normalizedPhoneNumber()
+    if (normalized.isEmpty()) {
+        return value
+    }
+    contactNameByNormalizedNumber[normalized]?.let { cached -> return cached }
+    val resolved = lookupContactName(value) ?: value
+    if (resolved != value) {
+        contactNameByNormalizedNumber[normalized] = resolved
+    }
+    return resolved
+}
+
+private fun MessagingViewModel.lookupContactName(phoneLikeValue: String): String? {
+    val context = getApplication<Application>().applicationContext
+    val hasContactsPermission =
+        ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.READ_CONTACTS,
+        ) == PackageManager.PERMISSION_GRANTED
+    if (!hasContactsPermission) {
+        return null
+    }
+
+    val projection = arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME)
+    val candidates =
+        listOf(phoneLikeValue, phoneLikeValue.normalizedPhoneNumber())
+            .map { candidate -> candidate.trim() }
+            .filter { candidate -> candidate.isNotEmpty() }
+            .distinct()
+
+    candidates.forEach { candidate ->
+        val lookupUri =
+            Uri.withAppendedPath(
+                ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
+                Uri.encode(candidate),
+            )
+        context.contentResolver
+            .query(lookupUri, projection, null, null, null)
+            ?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(ContactsContract.PhoneLookup.DISPLAY_NAME)
+                if (nameIndex != -1 && cursor.moveToFirst()) {
+                    val displayName = cursor.getString(nameIndex)?.trim().orEmpty()
+                    if (displayName.isNotEmpty()) {
+                        return displayName
+                    }
+                }
+            }
+    }
+    return null
+}
+
+private fun String.looksLikePhoneNumber(): Boolean =
+    any { character -> character.isDigit() }
+
+private fun inferOutgoing(
+    sync: com.wapp.wearmessage.sync.contract.SyncMessage,
+    participants: List<String>,
+): Boolean {
+    if (sync.outgoing != null) {
+        return sync.outgoing
+    }
+    if (sync.senderId.equals("self", ignoreCase = true)) {
+        return true
+    }
+
+    val senderNormalized = sync.senderId.normalizedPhoneNumber()
+    val participantNumbers =
+        participants
+            .map { participant -> participant.normalizedPhoneNumber() }
+            .filter { participant -> participant.isNotEmpty() }
+            .toSet()
+    val senderMatchesParticipant =
+        senderNormalized.isNotEmpty() && participantNumbers.contains(senderNormalized)
+
+    return when (sync.status) {
+        SyncMessageStatus.PENDING,
+        SyncMessageStatus.SENT,
+        SyncMessageStatus.FAILED -> true
+
+        SyncMessageStatus.DELIVERED -> false
+        SyncMessageStatus.READ -> !senderMatchesParticipant
+    }
+}
 
 private fun SyncMessageStatus.toMessageStatus(): MessageStatus =
     when (this) {
@@ -611,8 +925,11 @@ private fun Long.toClockLabel(): String {
 }
 
 private const val CACHE_PERSIST_DEBOUNCE_MS = 500L
+private const val SYNC_REQUEST_TIMEOUT_MS = 12_000L
 private const val MAX_CONVERSATIONS_IN_MEMORY = 300
 private const val MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY = 250
 private const val MAX_MESSAGES_PER_CONVERSATION_CACHE = 120
 private const val MAX_MESSAGES_TOTAL_CACHE = 1500
+private const val DRAFT_CONVERSATION_PREFIX = "draft-"
 private val CLOCK_FORMATTER: DateTimeFormatter = DateTimeFormatter.ofPattern("HH:mm")
+private const val TAG = "MessagingViewModel"

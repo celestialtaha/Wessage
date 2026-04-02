@@ -29,6 +29,7 @@ fun Message.toSyncMessage(
         timestampEpochMillis = nowEpochMillis,
         status = status.toSyncStatus(),
         localVersion = localVersion,
+        outgoing = outgoing,
     )
 
 fun MessageStatus.toSyncStatus(): SyncMessageStatus =

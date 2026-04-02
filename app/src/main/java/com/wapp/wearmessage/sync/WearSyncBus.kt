@@ -3,6 +3,7 @@ package com.wapp.wearmessage.sync
 import com.wapp.wearmessage.sync.contract.ConversationDeltaBatch
 import com.wapp.wearmessage.sync.contract.MessageDeltaBatch
 import com.wapp.wearmessage.sync.contract.MutationAck
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 
@@ -13,7 +14,12 @@ sealed interface SyncInboundEvent {
 }
 
 object WearSyncBus {
-    private val _events = MutableSharedFlow<SyncInboundEvent>(extraBufferCapacity = 64)
+    private val _events =
+        MutableSharedFlow<SyncInboundEvent>(
+            replay = 32,
+            extraBufferCapacity = 64,
+            onBufferOverflow = BufferOverflow.DROP_OLDEST,
+        )
     val events = _events.asSharedFlow()
 
     fun emit(event: SyncInboundEvent) {

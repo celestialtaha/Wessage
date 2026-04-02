@@ -33,7 +33,7 @@ enum class MessageStatus {
 
 sealed interface WearScreen {
     data object Conversations : WearScreen
-    data object Contacts : WearScreen
+    data object Compose : WearScreen
     data object Settings : WearScreen
     data class Thread(val conversationId: String) : WearScreen
 }
