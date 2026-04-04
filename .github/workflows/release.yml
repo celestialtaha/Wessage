@@ -41,16 +41,27 @@ jobs:
           yes | sdkmanager --licenses || true
           sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
-      - name: Build APKs
-        run: ./gradlew :app:assembleDebug :app:assembleRelease
+      - name: Build APKs (watch + phone foss)
+        run: |
+          ./gradlew :app:assembleRelease
+          (cd external/Messages-phone && ./gradlew :app:assembleFossRelease)
 
-      - name: Detect release APK paths
+      - name: Detect unsigned APK paths
         id: detect
         run: |
           if [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
-            echo "unsigned_exists=true" >> "$GITHUB_OUTPUT"
+            echo "watch_unsigned_exists=true" >> "$GITHUB_OUTPUT"
           else
-            echo "unsigned_exists=false" >> "$GITHUB_OUTPUT"
+            echo "watch_unsigned_exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          PHONE_UNSIGNED_APK="$(find external/Messages-phone/app/build/outputs/apk/foss/release -maxdepth 1 -type f -name '*unsigned*.apk' | sort | head -n 1 || true)"
+          if [ -n "$PHONE_UNSIGNED_APK" ] && [ -f "$PHONE_UNSIGNED_APK" ]; then
+            echo "phone_unsigned_exists=true" >> "$GITHUB_OUTPUT"
+            echo "phone_unsigned_apk=$PHONE_UNSIGNED_APK" >> "$GITHUB_OUTPUT"
+          else
+            echo "phone_unsigned_exists=false" >> "$GITHUB_OUTPUT"
+            echo "phone_unsigned_apk=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Check signing secrets availability
@@ -67,19 +78,17 @@ jobs:
             echo "enabled=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Sign release APK (optional)
+      - name: Sign release APKs (optional)
         id: sign_release
-        if: steps.detect.outputs.unsigned_exists == 'true' && steps.signing_ready.outputs.enabled == 'true'
+        if: steps.signing_ready.outputs.enabled == 'true'
         env:
           KEY_B64: ${{ secrets.ANDROID_SIGNING_KEY_BASE64 }}
           KEY_ALIAS: ${{ secrets.ANDROID_ALIAS }}
           STORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_PASS: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          PHONE_UNSIGNED_APK: ${{ steps.detect.outputs.phone_unsigned_apk }}
         run: |
           set -euo pipefail
-          UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
-          ALIGNED_APK="app/build/outputs/apk/release/app-release-aligned.apk"
-          SIGNED_APK="app/build/outputs/apk/release/app-release-signed.apk"
           KEYSTORE_PATH="$RUNNER_TEMP/release-keystore.jks"
           ZIPALIGN="${ANDROID_SDK_ROOT}/build-tools/36.0.0/zipalign"
           APKSIGNER="${ANDROID_SDK_ROOT}/build-tools/36.0.0/apksigner"
@@ -109,30 +118,90 @@ jobs:
             exit 1
           fi
 
-          "$ZIPALIGN" -f -p 4 "$UNSIGNED_APK" "$ALIGNED_APK"
-          "$APKSIGNER" sign \
-            --ks "$KEYSTORE_PATH" \
-            --ks-key-alias "$KEY_ALIAS" \
-            --ks-pass "pass:${STORE_PASS}" \
-            --key-pass "pass:${KEY_PASS}" \
-            --out "$SIGNED_APK" \
-            "$ALIGNED_APK"
-          "$APKSIGNER" verify "$SIGNED_APK"
+          if [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
+            WATCH_UNSIGNED_APK="app/build/outputs/apk/release/app-release-unsigned.apk"
+            WATCH_ALIGNED_APK="app/build/outputs/apk/release/app-release-aligned.apk"
+            WATCH_SIGNED_APK="app/build/outputs/apk/release/app-release-signed.apk"
+            "$ZIPALIGN" -f -p 4 "$WATCH_UNSIGNED_APK" "$WATCH_ALIGNED_APK"
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE_PATH" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass "pass:${STORE_PASS}" \
+              --key-pass "pass:${KEY_PASS}" \
+              --out "$WATCH_SIGNED_APK" \
+              "$WATCH_ALIGNED_APK"
+            "$APKSIGNER" verify "$WATCH_SIGNED_APK"
+            echo "watch_signed_release_file=$WATCH_SIGNED_APK" >> "$GITHUB_OUTPUT"
+          fi
+
+          if [ -n "${PHONE_UNSIGNED_APK}" ] && [ -f "${PHONE_UNSIGNED_APK}" ]; then
+            PHONE_ALIGNED_APK="${PHONE_UNSIGNED_APK%-unsigned.apk}-aligned.apk"
+            PHONE_SIGNED_APK="${PHONE_UNSIGNED_APK%-unsigned.apk}-signed.apk"
+            "$ZIPALIGN" -f -p 4 "${PHONE_UNSIGNED_APK}" "${PHONE_ALIGNED_APK}"
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE_PATH" \
+              --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass "pass:${STORE_PASS}" \
+              --key-pass "pass:${KEY_PASS}" \
+              --out "${PHONE_SIGNED_APK}" \
+              "${PHONE_ALIGNED_APK}"
+            "$APKSIGNER" verify "${PHONE_SIGNED_APK}"
+            echo "phone_signed_release_file=${PHONE_SIGNED_APK}" >> "$GITHUB_OUTPUT"
+          fi
 
           rm -f "$KEYSTORE_PATH"
-          echo "signed_release_file=$SIGNED_APK" >> "$GITHUB_OUTPUT"
 
       - name: Prepare release assets
         run: |
           set -euo pipefail
           mkdir -p dist
-          if [ -n "${{ steps.sign_release.outputs.signed_release_file }}" ] && [ -f "${{ steps.sign_release.outputs.signed_release_file }}" ]; then
-            cp "${{ steps.sign_release.outputs.signed_release_file }}" dist/wessage-release-signed.apk
-          elif [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
-            cp app/build/outputs/apk/release/app-release.apk dist/wessage-release.apk
-          elif [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
-            cp app/build/outputs/apk/release/app-release-unsigned.apk dist/wessage-release-unsigned.apk
+          WATCH_VERSION="${GITHUB_REF_NAME#v}"
+          PHONE_VERSION="$(awk -F= '/^VERSION_NAME=/{print $2}' external/Messages-phone/gradle.properties | tr -d '\r[:space:]')"
+          if [ -z "${PHONE_VERSION}" ]; then
+            PHONE_VERSION="${WATCH_VERSION}"
           fi
+
+          WATCH_SOURCE=""
+          WATCH_SUFFIX=""
+          if [ -n "${{ steps.sign_release.outputs.watch_signed_release_file }}" ] && [ -f "${{ steps.sign_release.outputs.watch_signed_release_file }}" ]; then
+            WATCH_SOURCE="${{ steps.sign_release.outputs.watch_signed_release_file }}"
+            WATCH_SUFFIX="signed"
+          elif [ -f "app/build/outputs/apk/release/app-release.apk" ]; then
+            WATCH_SOURCE="app/build/outputs/apk/release/app-release.apk"
+            WATCH_SUFFIX="release"
+          elif [ -f "app/build/outputs/apk/release/app-release-unsigned.apk" ]; then
+            WATCH_SOURCE="app/build/outputs/apk/release/app-release-unsigned.apk"
+            WATCH_SUFFIX="unsigned"
+          fi
+          if [ -z "$WATCH_SOURCE" ]; then
+            echo "Watch release APK not found."
+            exit 1
+          fi
+          cp "$WATCH_SOURCE" "dist/wessage-watch-v${WATCH_VERSION}-release-${WATCH_SUFFIX}.apk"
+
+          PHONE_RELEASE_DIR="external/Messages-phone/app/build/outputs/apk/foss/release"
+          PHONE_SOURCE=""
+          PHONE_SUFFIX=""
+          if [ -n "${{ steps.sign_release.outputs.phone_signed_release_file }}" ] && [ -f "${{ steps.sign_release.outputs.phone_signed_release_file }}" ]; then
+            PHONE_SOURCE="${{ steps.sign_release.outputs.phone_signed_release_file }}"
+            PHONE_SUFFIX="signed"
+          else
+            PHONE_NON_UNSIGNED="$(find "$PHONE_RELEASE_DIR" -maxdepth 1 -type f -name '*.apk' ! -name '*unsigned*.apk' ! -name '*-aligned.apk' ! -name '*-signed.apk' | sort | head -n 1 || true)"
+            PHONE_UNSIGNED="$(find "$PHONE_RELEASE_DIR" -maxdepth 1 -type f -name '*unsigned*.apk' | sort | head -n 1 || true)"
+            if [ -n "$PHONE_NON_UNSIGNED" ] && [ -f "$PHONE_NON_UNSIGNED" ]; then
+              PHONE_SOURCE="$PHONE_NON_UNSIGNED"
+              PHONE_SUFFIX="release"
+            elif [ -n "$PHONE_UNSIGNED" ] && [ -f "$PHONE_UNSIGNED" ]; then
+              PHONE_SOURCE="$PHONE_UNSIGNED"
+              PHONE_SUFFIX="unsigned"
+            fi
+          fi
+          if [ -z "$PHONE_SOURCE" ]; then
+            echo "Phone foss release APK not found."
+            exit 1
+          fi
+          cp "$PHONE_SOURCE" "dist/wessage-phone-foss-v${PHONE_VERSION}-release-${PHONE_SUFFIX}.apk"
+
           (cd dist && sha256sum *.apk > SHA256SUMS.txt)
 
       - name: Upload release artifacts
