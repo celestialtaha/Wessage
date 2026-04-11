@@ -350,6 +350,8 @@ class MessagingViewModel(
                             syncStatus =
                                 if (state.syncStatus == SyncStatus.OfflineQueue) {
                                     SyncStatus.OfflineQueue
+                                } else if (state.syncStatus == SyncStatus.Syncing) {
+                                    SyncStatus.Syncing
                                 } else {
                                     SyncStatus.Idle
                                 },
@@ -361,6 +363,8 @@ class MessagingViewModel(
                                     SyncStatus.OfflineQueue
                                 } else if (state.pendingMutations > 0) {
                                     SyncStatus.OfflineQueue
+                                } else if (state.syncStatus == SyncStatus.Syncing) {
+                                    SyncStatus.Syncing
                                 } else {
                                     SyncStatus.Idle
                                 }
