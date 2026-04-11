@@ -49,6 +49,7 @@ fun WearMessagingApp(
     var manualSyncInFlight by remember { mutableStateOf(false) }
     var pendingPageOffset by remember { mutableStateOf<Int?>(null) }
     var pendingPageLimit by remember { mutableIntStateOf(0) }
+    var cacheFullRefreshRequested by remember(syncProfile) { mutableStateOf(false) }
     var contactsPermissionGranted by remember {
         mutableStateOf(checkContactsPermission(context))
     }
@@ -78,8 +79,19 @@ fun WearMessagingApp(
     LaunchedEffect(syncProfile) {
         pendingPageOffset = 0
         conversationsExhausted = false
+        cacheFullRefreshRequested = false
         pendingPageLimit = initialConversationLimit
         requestBootstrapSync(limit = initialConversationLimit, offset = 0)
+    }
+
+    LaunchedEffect(loadedConversationCount, syncProfile, cacheFullRefreshRequested) {
+        if (cacheFullRefreshRequested) return@LaunchedEffect
+        if (loadedConversationCount <= initialConversationLimit) return@LaunchedEffect
+        val refreshLimit = loadedConversationCount.coerceIn(initialConversationLimit, MAX_CONVERSATION_COUNT)
+        cacheFullRefreshRequested = true
+        pendingPageOffset = 0
+        pendingPageLimit = refreshLimit
+        requestBootstrapSync(limit = refreshLimit, offset = 0)
     }
 
     LaunchedEffect(syncProfile, periodicSyncIntervalMs, initialConversationLimit) {
@@ -93,11 +105,13 @@ fun WearMessagingApp(
     val contactsPermissionLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             contactsPermissionGranted = granted
+            viewModel.onContactsPermissionChanged(granted)
         }
 
     fun launchComposeContactsScreen() {
         performActionHapticIfEnabled(uiState.settings.hapticsEnabled, hapticFeedback)
         contactsPermissionGranted = checkContactsPermission(context)
+        viewModel.onContactsPermissionChanged(contactsPermissionGranted)
         viewModel.openCompose()
     }
 
@@ -105,9 +119,15 @@ fun WearMessagingApp(
         if (manualSyncInFlight) return
         manualSyncInFlight = true
         performActionHapticIfEnabled(uiState.settings.hapticsEnabled, hapticFeedback)
+        val refreshLimit =
+            loadedConversationCount
+                .coerceAtLeast(initialConversationLimit)
+                .coerceAtMost(MAX_CONVERSATION_COUNT)
         scope.launch {
             try {
-                requestBootstrapSync(limit = initialConversationLimit, offset = 0)
+                pendingPageOffset = 0
+                pendingPageLimit = refreshLimit
+                requestBootstrapSync(limit = refreshLimit, offset = 0)
             } finally {
                 manualSyncInFlight = false
             }
@@ -229,17 +249,26 @@ fun WearMessagingApp(
                             actionsEnabled = !isBackground,
                             hapticsEnabled = uiState.settings.hapticsEnabled,
                             onQuickReply = { text ->
-                                viewModel.queueQuickReply(activeScreen.conversationId, text)
+                                val mutationId = newMutationId()
+                                viewModel.queueQuickReply(
+                                    conversationId = activeScreen.conversationId,
+                                    quickReply = text,
+                                    clientMutationId = mutationId,
+                                )
                                 scope.launch {
-                                    syncTransport.sendWatchMutation(
+                                    val sent =
+                                        syncTransport.sendWatchMutation(
                                         WatchMutation(
-                                            clientMutationId = newMutationId(),
+                                            clientMutationId = mutationId,
                                             type = WatchMutationType.REPLY,
                                             conversationId = activeScreen.conversationId,
                                             messageBody = text,
                                             createdAtEpochMillis = System.currentTimeMillis(),
                                         )
                                     )
+                                    if (!sent) {
+                                        viewModel.markMutationSendFailed(mutationId)
+                                    }
                                 }
                             },
                         )

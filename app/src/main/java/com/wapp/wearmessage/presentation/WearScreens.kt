@@ -410,8 +410,8 @@ internal fun ThreadScreen(
     val hapticFeedback = LocalHapticFeedback.current
     val expandedMessageIds = remember(conversation?.id) { mutableStateListOf<String>() }
     val listState = rememberScalingLazyListState()
-    var keyboardComposerVisible by remember { mutableStateOf(false) }
-    var keyboardDraft by remember { mutableStateOf("") }
+    var keyboardComposerVisible by remember(conversation?.id) { mutableStateOf(false) }
+    var keyboardDraft by remember(conversation?.id) { mutableStateOf("") }
     var initialPositionedAtLatest by remember(conversation?.id) { mutableStateOf(false) }
     val voiceReplyLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
@@ -532,6 +532,7 @@ internal fun ThreadScreen(
                         MessageBubble(
                             message = message,
                             layoutSpec = layoutSpec,
+                            interactionsEnabled = actionsEnabled,
                             expanded = expandedMessageIds.contains(message.id),
                             onToggleExpanded = { toggleExpanded(message.id) },
                         )
@@ -776,6 +777,7 @@ internal fun ConversationCard(
 internal fun MessageBubble(
     message: Message,
     layoutSpec: WearLayoutSpec,
+    interactionsEnabled: Boolean,
     expanded: Boolean,
     onToggleExpanded: () -> Unit,
 ) {
@@ -808,7 +810,14 @@ internal fun MessageBubble(
         } else {
             message.timestamp
         }
-    val affordanceLabel = if (expanded) "Tap to collapse" else "Tap to expand"
+    val affordanceLabel =
+        if (!interactionsEnabled) {
+            null
+        } else if (expanded) {
+            "Tap to collapse"
+        } else {
+            "Tap to expand"
+        }
 
     BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
         val maxBubbleWidth = maxWidth * layoutSpec.messageBubbleWidthFraction
@@ -820,7 +829,7 @@ internal fun MessageBubble(
                         .padding(horizontal = layoutSpec.messageBubbleHorizontalInset)
                         .align(if (message.outgoing) Alignment.CenterEnd else Alignment.CenterStart)
                         .widthIn(max = maxBubbleWidth),
-                enabled = true,
+                enabled = interactionsEnabled,
                 colors = bubbleColors,
                 border = bubbleBorder,
             ) {
@@ -842,12 +851,14 @@ internal fun MessageBubble(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                     )
-                    Text(
-                        text = affordanceLabel,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
+                    if (affordanceLabel != null) {
+                        Text(
+                            text = affordanceLabel,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
             }
         }

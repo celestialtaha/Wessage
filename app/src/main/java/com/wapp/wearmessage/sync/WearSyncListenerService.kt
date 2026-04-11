@@ -9,7 +9,9 @@ import com.google.android.gms.wearable.Wearable
 import com.google.android.gms.wearable.WearableListenerService
 import com.wapp.wearmessage.sync.contract.SyncJsonCodec
 import com.wapp.wearmessage.sync.contract.SyncPaths
+import com.wapp.wearmessage.sync.contract.BootstrapRequest
 import com.wapp.wearmessage.sync.security.SecureSyncCodec
+import org.json.JSONObject
 
 class WearSyncListenerService : WearableListenerService() {
     private val secureCodec by lazy { SecureSyncCodec(this) }
@@ -22,17 +24,41 @@ class WearSyncListenerService : WearableListenerService() {
             val path = item.uri.path ?: return@forEach
             val sourceNodeId = item.uri.host.orEmpty()
             val payload = DataMapItem.fromDataItem(item).dataMap.getByteArray(PAYLOAD_KEY) ?: return@forEach
-            val plainPayload = secureCodec.decrypt(sourceNodeId = sourceNodeId, path = path, envelopePayload = payload) ?: payload
+            val decryptedPayload =
+                secureCodec.decrypt(
+                    sourceNodeId = sourceNodeId,
+                    path = path,
+                    envelopePayload = payload,
+                )
+            val plainPayload = decryptedPayload ?: payload
             when (path) {
                 SyncPaths.CONVERSATIONS -> {
                     val delta = SyncJsonCodec.decodeConversationDeltaBatch(plainPayload)
-                    delta?.let { WearSyncBus.emit(SyncInboundEvent.Conversations(it)) }
-                    Log.d(TAG, "Conversations delta received: ${delta?.conversations?.size ?: 0}")
+                    if (delta != null) {
+                        WearSyncBus.emit(SyncInboundEvent.Conversations(delta))
+                        Log.d(TAG, "Conversations delta received: ${delta.conversations.size}")
+                    } else {
+                        handleDecodeFailure(
+                            sourceNodeId = sourceNodeId,
+                            path = path,
+                            payload = payload,
+                            decryptedPayload = decryptedPayload,
+                        )
+                    }
                 }
                 SyncPaths.MESSAGES -> {
                     val delta = SyncJsonCodec.decodeMessageDeltaBatch(plainPayload)
-                    delta?.let { WearSyncBus.emit(SyncInboundEvent.Messages(it)) }
-                    Log.d(TAG, "Messages delta received: ${delta?.messages?.size ?: 0}")
+                    if (delta != null) {
+                        WearSyncBus.emit(SyncInboundEvent.Messages(delta))
+                        Log.d(TAG, "Messages delta received: ${delta.messages.size}")
+                    } else {
+                        handleDecodeFailure(
+                            sourceNodeId = sourceNodeId,
+                            path = path,
+                            payload = payload,
+                            decryptedPayload = decryptedPayload,
+                        )
+                    }
                 }
             }
         }
@@ -48,6 +74,9 @@ class WearSyncListenerService : WearableListenerService() {
             SyncPaths.KEY_EXCHANGE_RESPONSE -> {
                 val accepted = secureCodec.handleKeyExchangePayload(messageEvent.sourceNodeId, messageEvent.data)
                 Log.d(TAG, "Key exchange response handled=$accepted source=${messageEvent.sourceNodeId}")
+                if (accepted) {
+                    requestBootstrap(messageEvent.sourceNodeId)
+                }
             }
             SyncPaths.ACK -> {
                 val plainPayload =
@@ -76,6 +105,44 @@ class WearSyncListenerService : WearableListenerService() {
                 Log.w(TAG, "Failed sending key exchange response", error)
             }
     }
+
+    private fun requestBootstrap(nodeId: String) {
+        val payload = SyncJsonCodec.encodeBootstrapRequest(BootstrapRequest())
+        messageClient
+            .sendMessage(nodeId, SyncPaths.BOOTSTRAP_REQUEST, payload)
+            .addOnFailureListener { error ->
+                Log.w(TAG, "Failed requesting bootstrap after key exchange", error)
+            }
+    }
+
+    private fun handleDecodeFailure(
+        sourceNodeId: String,
+        path: String,
+        payload: ByteArray,
+        decryptedPayload: ByteArray?,
+    ) {
+        val encryptedLikely = decryptedPayload == null && payload.looksLikeEncryptedEnvelope()
+        Log.w(
+            TAG,
+            "Failed to decode sync batch path=$path encryptedLikely=$encryptedLikely payloadBytes=${payload.size}",
+        )
+        if (encryptedLikely) {
+            messageClient
+                .sendMessage(
+                    sourceNodeId,
+                    SyncPaths.KEY_EXCHANGE_REQUEST,
+                    secureCodec.createKeyExchangePayload(),
+                ).addOnFailureListener { error ->
+                    Log.w(TAG, "Failed requesting key exchange recovery", error)
+                }
+        }
+    }
+
+    private fun ByteArray.looksLikeEncryptedEnvelope(): Boolean =
+        runCatching {
+            val json = JSONObject(toString(Charsets.UTF_8))
+            json.has("senderPublicKey") && json.has("nonce") && json.has("ciphertext")
+        }.getOrDefault(false)
 
     private companion object {
         private const val TAG = "WearSyncListener"

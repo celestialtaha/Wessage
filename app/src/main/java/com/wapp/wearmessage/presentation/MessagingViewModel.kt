@@ -3,7 +3,6 @@ package com.wapp.wearmessage.presentation
 import android.Manifest
 import android.app.Application
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.provider.ContactsContract
 import android.util.Log
 import androidx.core.content.ContextCompat
@@ -22,18 +21,17 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import java.util.concurrent.ConcurrentHashMap
 import java.util.LinkedHashMap
 import kotlin.math.absoluteValue
 
-private val contactNameByNormalizedNumber = mutableMapOf<String, String>()
+private val contactNameByNormalizedNumber = ConcurrentHashMap<String, String>()
 
 class MessagingViewModel(
     application: Application,
@@ -46,9 +44,16 @@ class MessagingViewModel(
     private var persistCacheJob: Job? = null
     private var syncTimeoutJob: Job? = null
     private var syncRequestTicket: Long = 0L
+    private val pendingMutationConversationById = mutableMapOf<String, String>()
+    private val mutationAckTimeoutJobs = mutableMapOf<String, Job>()
+    private var lastConversationSnapshotCursor: Long? = null
+    private var lastConversationSnapshotIds: Set<String> = emptySet()
+    private var latestConversationBatchCursor: Long = Long.MIN_VALUE
+    private var latestMessageBatchCursor: Long = Long.MIN_VALUE
 
     init {
         restoreSettings()
+        warmContactNameCache()
         bootstrapData()
         observeIncomingSync()
         observeCachePersistence()
@@ -156,12 +161,15 @@ class MessagingViewModel(
         }
     }
 
-    fun queueQuickReply(conversationId: String, quickReply: String) {
+    fun queueQuickReply(
+        conversationId: String,
+        quickReply: String,
+        clientMutationId: String,
+    ) {
         val now = System.currentTimeMillis()
-        val mutationId = "watch-${System.currentTimeMillis()}"
         val optimisticMessage =
             Message(
-                id = mutationId,
+                id = clientMutationId,
                 conversationId = conversationId,
                 senderId = "self",
                 senderName = "You",
@@ -175,7 +183,7 @@ class MessagingViewModel(
         _uiState.update { state ->
             state.copy(
                 pendingMutations = state.pendingMutations + 1,
-                syncStatus = SyncStatus.OfflineQueue,
+                syncStatus = SyncStatus.Syncing,
                 messagesByConversation =
                     state.messagesByConversation +
                         (conversationId to
@@ -189,31 +197,39 @@ class MessagingViewModel(
                 },
             )
         }
-
-        viewModelScope.launch {
-            delay(850)
-            _uiState.update { state ->
-                val pendingAfterAck = (state.pendingMutations - 1).coerceAtLeast(0)
-                val updatedMessages =
-                    state.messagesByConversation[conversationId]
-                        .orEmpty()
-                        .map { message ->
-                            if (message.id == mutationId) {
-                                message.copy(
-                                    status = MessageStatus.Sent,
-                                    localVersion = message.localVersion + 1,
-                                )
-                            } else {
-                                message
-                            }
-                        }
-                state.copy(
-                    pendingMutations = pendingAfterAck,
-                    syncStatus = if (pendingAfterAck == 0) SyncStatus.Idle else SyncStatus.Syncing,
-                    messagesByConversation =
-                        state.messagesByConversation + (conversationId to updatedMessages),
-                )
+        pendingMutationConversationById[clientMutationId] = conversationId
+        mutationAckTimeoutJobs.remove(clientMutationId)?.cancel()
+        mutationAckTimeoutJobs[clientMutationId] =
+            viewModelScope.launch {
+                delay(MUTATION_ACK_TIMEOUT_MS)
+                markMutationSendFailed(clientMutationId)
             }
+    }
+
+    fun markMutationSendFailed(clientMutationId: String) {
+        mutationAckTimeoutJobs.remove(clientMutationId)?.cancel()
+        val conversationId = pendingMutationConversationById.remove(clientMutationId) ?: return
+        _uiState.update { state ->
+            val pendingAfterFailure = (state.pendingMutations - 1).coerceAtLeast(0)
+            val updatedMessages =
+                state.messagesByConversation[conversationId]
+                    .orEmpty()
+                    .map { message ->
+                        if (message.id == clientMutationId) {
+                            message.copy(
+                                status = MessageStatus.Failed,
+                                localVersion = message.localVersion + 1,
+                            )
+                        } else {
+                            message
+                        }
+                    }
+            state.copy(
+                pendingMutations = pendingAfterFailure,
+                syncStatus = SyncStatus.OfflineQueue,
+                messagesByConversation =
+                    state.messagesByConversation + (conversationId to updatedMessages),
+            )
         }
     }
 
@@ -303,6 +319,12 @@ class MessagingViewModel(
     fun markSyncRequestFailed() {
         syncTimeoutJob?.cancel()
         _uiState.update { state -> state.copy(syncStatus = SyncStatus.OfflineQueue) }
+    }
+
+    fun onContactsPermissionChanged(granted: Boolean) {
+        if (granted) {
+            warmContactNameCache()
+        }
     }
 
     private fun bootstrapData() {
@@ -436,23 +458,23 @@ class MessagingViewModel(
     private fun observeCachePersistence() {
         viewModelScope.launch {
             uiState
-                .map { state -> state.toCachedSyncSnapshotOrNull() }
-                .distinctUntilChanged()
-                .collect { snapshot ->
-                    if (snapshot != null) {
-                        persistCacheJob?.cancel()
-                        persistCacheJob =
-                            viewModelScope.launch {
-                                delay(CACHE_PERSIST_DEBOUNCE_MS)
-                                withContext(Dispatchers.IO) {
-                                    runCatching {
-                                        secureCache.save(snapshot)
-                                    }.onFailure { error ->
-                                        Log.w(TAG, "Failed to persist encrypted cache snapshot", error)
-                                    }
+                .collect { state ->
+                    persistCacheJob?.cancel()
+                    persistCacheJob =
+                        viewModelScope.launch {
+                            delay(CACHE_PERSIST_DEBOUNCE_MS)
+                            val snapshot =
+                                withContext(Dispatchers.Default) {
+                                    state.toCachedSyncSnapshotOrNull()
+                                } ?: return@launch
+                            withContext(Dispatchers.IO) {
+                                runCatching {
+                                    secureCache.save(snapshot)
+                                }.onFailure { error ->
+                                    Log.w(TAG, "Failed to persist encrypted cache snapshot", error)
                                 }
                             }
-                    }
+                        }
                 }
         }
     }
@@ -469,9 +491,112 @@ class MessagingViewModel(
         }
     }
 
+    private fun warmContactNameCache() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val resolvedNames = loadContactNameMap()
+            if (resolvedNames.isEmpty()) {
+                return@launch
+            }
+            contactNameByNormalizedNumber.putAll(resolvedNames)
+            withContext(Dispatchers.Default) {
+                refreshParticipantLabelsFromCache()
+            }
+        }
+    }
+
+    private fun loadContactNameMap(): Map<String, String> {
+        val context = getApplication<Application>().applicationContext
+        val hasContactsPermission =
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.READ_CONTACTS,
+            ) == PackageManager.PERMISSION_GRANTED
+        if (!hasContactsPermission) {
+            return emptyMap()
+        }
+
+        val projection =
+            arrayOf(
+                ContactsContract.CommonDataKinds.Phone.NUMBER,
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
+            )
+        val mappedNames = mutableMapOf<String, String>()
+        context.contentResolver
+            .query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                projection,
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                val numberIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY)
+                if (numberIndex == -1 || nameIndex == -1) {
+                    return emptyMap()
+                }
+                while (cursor.moveToNext()) {
+                    val normalizedNumber = cursor.getString(numberIndex)?.normalizedPhoneNumber().orEmpty()
+                    val displayName = cursor.getString(nameIndex)?.trim().orEmpty()
+                    if (normalizedNumber.isNotEmpty() && displayName.isNotEmpty()) {
+                        mappedNames.putIfAbsent(normalizedNumber, displayName)
+                    }
+                }
+            }
+        return mappedNames
+    }
+
+    private fun refreshParticipantLabelsFromCache() {
+        _uiState.update { state ->
+            val updatedConversationsState =
+                when (val conversationsState = state.conversationsState) {
+                    is ConversationsUiState.Success -> {
+                        ConversationsUiState.Success(
+                            conversationsState.conversations.map { conversation ->
+                                conversation.copy(
+                                    title =
+                                        resolveConversationTitle(
+                                            participants = conversation.participants,
+                                            fallbackTitle = conversation.title,
+                                            fallbackConversationId = conversation.id,
+                                        ),
+                                )
+                            }
+                        )
+                    }
+                    else -> conversationsState
+                }
+            val updatedMessagesByConversation =
+                state.messagesByConversation.mapValues { (_, messages) ->
+                    messages.map { message ->
+                        if (message.outgoing) {
+                            message
+                        } else {
+                            val resolved = resolveParticipantLabel(message.senderId)
+                            if (resolved == message.senderName) {
+                                message
+                            } else {
+                                message.copy(senderName = resolved)
+                            }
+                        }
+                    }
+                }
+            state.copy(
+                conversationsState = updatedConversationsState,
+                messagesByConversation = updatedMessagesByConversation,
+            )
+        }
+    }
+
     private fun applyConversationDelta(batch: com.wapp.wearmessage.sync.contract.ConversationDeltaBatch) {
+        if (batch.cursor < latestConversationBatchCursor) {
+            Log.d(TAG, "Ignoring stale conversations batch cursor=${batch.cursor}")
+            return
+        }
         hasReceivedSyncPayload = true
         syncTimeoutJob?.cancel()
+        latestConversationBatchCursor = batch.cursor
+        lastConversationSnapshotCursor = batch.cursor
+        lastConversationSnapshotIds = batch.conversations.map { it.id }.toSet()
         _uiState.update { state ->
             val mergedById =
                 mutableMapOf<String, Conversation>().apply {
@@ -523,14 +648,25 @@ class MessagingViewModel(
                     state.messagesByConversation.filterKeys { conversationId ->
                         retainedConversationIds.contains(conversationId)
                     },
-                syncStatus = SyncStatus.Idle,
+                syncStatus = if (state.pendingMutations > 0) SyncStatus.Syncing else SyncStatus.Idle,
             )
         }
     }
 
     private fun applyMessageDelta(batch: com.wapp.wearmessage.sync.contract.MessageDeltaBatch) {
+        if (batch.cursor < latestMessageBatchCursor) {
+            Log.d(TAG, "Ignoring stale messages batch cursor=${batch.cursor}")
+            return
+        }
         hasReceivedSyncPayload = true
         syncTimeoutJob?.cancel()
+        latestMessageBatchCursor = batch.cursor
+        val snapshotConversationIds =
+            if (batch.cursor == lastConversationSnapshotCursor) {
+                lastConversationSnapshotIds
+            } else {
+                emptySet()
+            }
         _uiState.update { state ->
             val deletedMessageIds = batch.deletedMessageIds.toHashSet()
             val groupedMessages = batch.messages.groupBy { it.conversationId }
@@ -547,15 +683,25 @@ class MessagingViewModel(
                         }
                     }
                     .toMutableMap()
+            val conversationIdsToProcess =
+                linkedSetOf<String>().apply {
+                    addAll(groupedMessages.keys)
+                    addAll(snapshotConversationIds)
+                }
 
-            groupedMessages.forEach { (conversationId, syncMessages) ->
+            conversationIdsToProcess.forEach { conversationId ->
+                val syncMessages = groupedMessages[conversationId].orEmpty()
                 val mergedById =
-                    LinkedHashMap<String, Message>().apply {
-                        baseMessagesByConversation[conversationId]
-                            .orEmpty()
-                            .forEach { message ->
-                                put(message.id, message)
-                            }
+                    if (snapshotConversationIds.contains(conversationId)) {
+                        LinkedHashMap()
+                    } else {
+                        LinkedHashMap<String, Message>().apply {
+                            baseMessagesByConversation[conversationId]
+                                .orEmpty()
+                                .forEach { message ->
+                                    put(message.id, message)
+                                }
+                        }
                     }
                 syncMessages
                     .sortedBy { it.timestampEpochMillis }
@@ -599,25 +745,54 @@ class MessagingViewModel(
 
             state.copy(
                 messagesByConversation = mergedMessagesByConversation,
-                syncStatus = SyncStatus.Idle,
+                syncStatus = if (state.pendingMutations > 0) SyncStatus.Syncing else SyncStatus.Idle,
             )
         }
     }
 
     private fun applyMutationAck(ack: com.wapp.wearmessage.sync.contract.MutationAck) {
         syncTimeoutJob?.cancel()
+        mutationAckTimeoutJobs.remove(ack.clientMutationId)?.cancel()
         _uiState.update { state ->
-            val pendingAfterAck = (state.pendingMutations - 1).coerceAtLeast(0)
+            val conversationId = pendingMutationConversationById.remove(ack.clientMutationId)
+            val updatedMessagesByConversation =
+                if (conversationId == null) {
+                    state.messagesByConversation
+                } else {
+                    val updatedMessages =
+                        state.messagesByConversation[conversationId]
+                            .orEmpty()
+                            .map { message ->
+                                if (message.id == ack.clientMutationId) {
+                                    message.copy(
+                                        status = if (ack.accepted) MessageStatus.Sent else MessageStatus.Failed,
+                                        localVersion = message.localVersion + 1,
+                                    )
+                                } else {
+                                    message
+                                }
+                            }
+                    state.messagesByConversation + (conversationId to updatedMessages)
+                }
+            val pendingAfterAck =
+                if (conversationId == null) {
+                    state.pendingMutations
+                } else {
+                    (state.pendingMutations - 1).coerceAtLeast(0)
+                }
             state.copy(
                 pendingMutations = pendingAfterAck,
                 syncStatus =
                     if (!ack.accepted) {
                         SyncStatus.OfflineQueue
-                    } else if (pendingAfterAck == 0) {
-                        SyncStatus.Idle
-                    } else {
+                    } else if (pendingAfterAck > 0) {
                         SyncStatus.Syncing
+                    } else if (state.syncStatus == SyncStatus.OfflineQueue) {
+                        SyncStatus.OfflineQueue
+                    } else {
+                        SyncStatus.Idle
                     },
+                messagesByConversation = updatedMessagesByConversation,
             )
         }
     }
@@ -625,6 +800,13 @@ class MessagingViewModel(
     override fun onCleared() {
         persistCacheJob?.cancel()
         syncTimeoutJob?.cancel()
+        mutationAckTimeoutJobs.values.forEach { it.cancel() }
+        mutationAckTimeoutJobs.clear()
+        pendingMutationConversationById.clear()
+        lastConversationSnapshotCursor = null
+        lastConversationSnapshotIds = emptySet()
+        latestConversationBatchCursor = Long.MIN_VALUE
+        latestMessageBatchCursor = Long.MIN_VALUE
         super.onCleared()
     }
 
@@ -741,51 +923,7 @@ private fun MessagingViewModel.resolveParticipantLabel(rawValue: String): String
     if (normalized.isEmpty()) {
         return value
     }
-    contactNameByNormalizedNumber[normalized]?.let { cached -> return cached }
-    val resolved = lookupContactName(value) ?: value
-    if (resolved != value) {
-        contactNameByNormalizedNumber[normalized] = resolved
-    }
-    return resolved
-}
-
-private fun MessagingViewModel.lookupContactName(phoneLikeValue: String): String? {
-    val context = getApplication<Application>().applicationContext
-    val hasContactsPermission =
-        ContextCompat.checkSelfPermission(
-            context,
-            Manifest.permission.READ_CONTACTS,
-        ) == PackageManager.PERMISSION_GRANTED
-    if (!hasContactsPermission) {
-        return null
-    }
-
-    val projection = arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME)
-    val candidates =
-        listOf(phoneLikeValue, phoneLikeValue.normalizedPhoneNumber())
-            .map { candidate -> candidate.trim() }
-            .filter { candidate -> candidate.isNotEmpty() }
-            .distinct()
-
-    candidates.forEach { candidate ->
-        val lookupUri =
-            Uri.withAppendedPath(
-                ContactsContract.PhoneLookup.CONTENT_FILTER_URI,
-                Uri.encode(candidate),
-            )
-        context.contentResolver
-            .query(lookupUri, projection, null, null, null)
-            ?.use { cursor ->
-                val nameIndex = cursor.getColumnIndex(ContactsContract.PhoneLookup.DISPLAY_NAME)
-                if (nameIndex != -1 && cursor.moveToFirst()) {
-                    val displayName = cursor.getString(nameIndex)?.trim().orEmpty()
-                    if (displayName.isNotEmpty()) {
-                        return displayName
-                    }
-                }
-            }
-    }
-    return null
+    return contactNameByNormalizedNumber[normalized] ?: value
 }
 
 private fun String.looksLikePhoneNumber(): Boolean =
@@ -803,6 +941,16 @@ private fun inferOutgoing(
     }
 
     val senderNormalized = sync.senderId.normalizedPhoneNumber()
+    if (senderNormalized.isEmpty()) {
+        return when (sync.status) {
+            SyncMessageStatus.PENDING,
+            SyncMessageStatus.SENT,
+            SyncMessageStatus.FAILED -> true
+
+            SyncMessageStatus.DELIVERED,
+            SyncMessageStatus.READ -> false
+        }
+    }
     val participantNumbers =
         participants
             .map { participant -> participant.normalizedPhoneNumber() }
@@ -816,7 +964,7 @@ private fun inferOutgoing(
         SyncMessageStatus.SENT,
         SyncMessageStatus.FAILED -> true
 
-        SyncMessageStatus.DELIVERED -> false
+        SyncMessageStatus.DELIVERED,
         SyncMessageStatus.READ -> !senderMatchesParticipant
     }
 }
@@ -926,6 +1074,7 @@ private fun Long.toClockLabel(): String {
 
 private const val CACHE_PERSIST_DEBOUNCE_MS = 500L
 private const val SYNC_REQUEST_TIMEOUT_MS = 12_000L
+private const val MUTATION_ACK_TIMEOUT_MS = 15_000L
 private const val MAX_CONVERSATIONS_IN_MEMORY = 300
 private const val MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY = 250
 private const val MAX_MESSAGES_PER_CONVERSATION_CACHE = 120
