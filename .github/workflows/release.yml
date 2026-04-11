@@ -21,6 +21,14 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Checkout phone app repo
+        uses: actions/checkout@v6
+        with:
+          repository: celestialtaha/Messages
+          ref: main
+          path: external/Messages-phone
+          fetch-depth: 1
+
       - name: Validate Gradle Wrapper
         uses: gradle/actions/wrapper-validation@v5
 
