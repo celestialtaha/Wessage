@@ -19,8 +19,6 @@ import androidx.wear.compose.foundation.BasicSwipeToDismissBox
 import androidx.wear.compose.material3.AppScaffold
 import com.wapp.wearmessage.presentation.theme.WessageTheme
 import com.wapp.wearmessage.sync.WearSyncTransport
-import com.wapp.wearmessage.sync.contract.WatchMutation
-import com.wapp.wearmessage.sync.contract.WatchMutationType
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -74,6 +72,14 @@ fun WearMessagingApp(
         loadingMoreConversations = false
         pendingPageOffset = null
         pendingPageLimit = 0
+    }
+
+    LaunchedEffect(uiState.syncStatus, pendingPageOffset) {
+        if (pendingPageOffset != null && uiState.syncStatus == SyncStatus.OfflineQueue) {
+            loadingMoreConversations = false
+            pendingPageOffset = null
+            pendingPageLimit = 0
+        }
     }
 
     LaunchedEffect(syncProfile) {
@@ -187,7 +193,7 @@ fun WearMessagingApp(
                                         pendingPageOffset = nextOffset
                                         pendingPageLimit = conversationPageSize
                                         val sent =
-                                            syncTransport.requestBootstrapSync(
+                                            requestBootstrapSync(
                                                 limit = conversationPageSize,
                                                 offset = nextOffset,
                                             )
@@ -249,27 +255,10 @@ fun WearMessagingApp(
                             actionsEnabled = !isBackground,
                             hapticsEnabled = uiState.settings.hapticsEnabled,
                             onQuickReply = { text ->
-                                val mutationId = newMutationId()
-                                viewModel.queueQuickReply(
+                                viewModel.sendQuickReply(
                                     conversationId = activeScreen.conversationId,
                                     quickReply = text,
-                                    clientMutationId = mutationId,
                                 )
-                                scope.launch {
-                                    val sent =
-                                        syncTransport.sendWatchMutation(
-                                        WatchMutation(
-                                            clientMutationId = mutationId,
-                                            type = WatchMutationType.REPLY,
-                                            conversationId = activeScreen.conversationId,
-                                            messageBody = text,
-                                            createdAtEpochMillis = System.currentTimeMillis(),
-                                        )
-                                    )
-                                    if (!sent) {
-                                        viewModel.markMutationSendFailed(mutationId)
-                                    }
-                                }
                             },
                         )
                     }

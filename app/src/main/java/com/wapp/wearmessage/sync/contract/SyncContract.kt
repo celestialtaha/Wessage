@@ -6,6 +6,7 @@ object SyncPaths {
     const val ROOT = "/wessage/sync/v1"
     const val CONVERSATIONS = "$ROOT/conversations"
     const val MESSAGES = "$ROOT/messages"
+    const val MESSAGE_CHUNKS = "$MESSAGES/chunks"
     const val MUTATION = "$ROOT/mutation"
     const val ACK = "$ROOT/ack"
     const val BOOTSTRAP_REQUEST = "$ROOT/bootstrap_request"
@@ -54,6 +55,7 @@ data class MessageDeltaBatch(
     val cursor: Long,
     val generatedAtEpochMillis: Long,
     val messages: List<SyncMessage>,
+    val conversationIds: List<String>,
     val deletedMessageIds: List<String> = emptyList(),
 )
 
@@ -77,6 +79,7 @@ data class WatchMutation(
     val type: WatchMutationType,
     val conversationId: String,
     val messageBody: String? = null,
+    val recipientAddresses: List<String>,
     val createdAtEpochMillis: Long,
 )
 

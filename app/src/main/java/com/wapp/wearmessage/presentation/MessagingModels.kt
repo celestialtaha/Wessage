@@ -18,6 +18,7 @@ data class Message(
     val senderName: String,
     val body: String,
     val timestamp: String,
+    val timestampEpochMillis: Long,
     val status: MessageStatus,
     val localVersion: Int,
     val outgoing: Boolean,

@@ -413,6 +413,7 @@ internal fun ThreadScreen(
     var keyboardComposerVisible by remember(conversation?.id) { mutableStateOf(false) }
     var keyboardDraft by remember(conversation?.id) { mutableStateOf("") }
     var initialPositionedAtLatest by remember(conversation?.id) { mutableStateOf(false) }
+    var lastSeenMessageCount by remember(conversation?.id) { mutableIntStateOf(0) }
     val voiceReplyLauncher =
         rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             if (result.resultCode != Activity.RESULT_OK) return@rememberLauncherForActivityResult
@@ -461,10 +462,14 @@ internal fun ThreadScreen(
     }
 
     LaunchedEffect(conversation?.id, messages.size) {
-        if (!initialPositionedAtLatest && messages.isNotEmpty()) {
+        val previousLastIndex = (lastSeenMessageCount - 1).coerceAtLeast(0)
+        val wasNearLatest = listState.centerItemIndex >= (previousLastIndex - 2).coerceAtLeast(0)
+        val hasNewMessages = messages.size > lastSeenMessageCount
+        if (messages.isNotEmpty() && (!initialPositionedAtLatest || (hasNewMessages && wasNearLatest))) {
             listState.scrollToItem(index = messages.lastIndex)
             initialPositionedAtLatest = true
         }
+        lastSeenMessageCount = messages.size
     }
 
     ScreenScaffold(

@@ -10,11 +10,15 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.wapp.wearmessage.storage.CachedConversation
 import com.wapp.wearmessage.storage.CachedMessage
+import com.wapp.wearmessage.storage.CachedPendingMutation
 import com.wapp.wearmessage.storage.CachedSyncSnapshot
 import com.wapp.wearmessage.storage.SecureMessageCache
 import com.wapp.wearmessage.sync.SyncInboundEvent
 import com.wapp.wearmessage.sync.WearSyncBus
+import com.wapp.wearmessage.sync.WearSyncTransport
 import com.wapp.wearmessage.sync.contract.SyncMessageStatus
+import com.wapp.wearmessage.sync.contract.WatchMutation
+import com.wapp.wearmessage.sync.contract.WatchMutationType
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -22,6 +26,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.time.Instant
@@ -40,14 +45,16 @@ class MessagingViewModel(
     val uiState: StateFlow<WearMessagingUiState> = _uiState.asStateFlow()
     private val secureCache = SecureMessageCache(application.applicationContext)
     private val settingsStore = SettingsStore(application.applicationContext)
+    private val syncTransport = WearSyncTransport(application.applicationContext)
     private var hasReceivedSyncPayload = false
     private var persistCacheJob: Job? = null
     private var syncTimeoutJob: Job? = null
+    private var outboxRetryJob: Job? = null
     private var syncRequestTicket: Long = 0L
+    private val pendingMutationIds = mutableSetOf<String>()
     private val pendingMutationConversationById = mutableMapOf<String, String>()
+    private val pendingMutationById = mutableMapOf<String, PendingMutationRecord>()
     private val mutationAckTimeoutJobs = mutableMapOf<String, Job>()
-    private var lastConversationSnapshotCursor: Long? = null
-    private var lastConversationSnapshotIds: Set<String> = emptySet()
     private var latestConversationBatchCursor: Long = Long.MIN_VALUE
     private var latestMessageBatchCursor: Long = Long.MIN_VALUE
 
@@ -57,6 +64,7 @@ class MessagingViewModel(
         bootstrapData()
         observeIncomingSync()
         observeCachePersistence()
+        observeMutationOutbox()
     }
 
     fun openConversations() {
@@ -161,12 +169,37 @@ class MessagingViewModel(
         }
     }
 
-    fun queueQuickReply(
+    fun sendQuickReply(
+        conversationId: String,
+        quickReply: String,
+    ) {
+        val mutationId = newMutationId()
+        val createdAtEpochMillis = System.currentTimeMillis()
+        val recipientAddresses = recipientAddressesForConversation(conversationId)
+        queueQuickReply(
+            conversationId = conversationId,
+            quickReply = quickReply,
+            clientMutationId = mutationId,
+            createdAtEpochMillis = createdAtEpochMillis,
+        )
+        enqueueMutationForDelivery(
+            WatchMutation(
+                clientMutationId = mutationId,
+                type = WatchMutationType.REPLY,
+                conversationId = conversationId,
+                messageBody = quickReply,
+                recipientAddresses = recipientAddresses,
+                createdAtEpochMillis = createdAtEpochMillis,
+            )
+        )
+    }
+
+    private fun queueQuickReply(
         conversationId: String,
         quickReply: String,
         clientMutationId: String,
+        createdAtEpochMillis: Long,
     ) {
-        val now = System.currentTimeMillis()
         val optimisticMessage =
             Message(
                 id = clientMutationId,
@@ -175,6 +208,7 @@ class MessagingViewModel(
                 senderName = "You",
                 body = quickReply,
                 timestamp = "Now",
+                timestampEpochMillis = createdAtEpochMillis,
                 status = MessageStatus.Pending,
                 localVersion = 1,
                 outgoing = true,
@@ -182,7 +216,6 @@ class MessagingViewModel(
 
         _uiState.update { state ->
             state.copy(
-                pendingMutations = state.pendingMutations + 1,
                 syncStatus = SyncStatus.Syncing,
                 messagesByConversation =
                     state.messagesByConversation +
@@ -191,50 +224,28 @@ class MessagingViewModel(
                 conversationsState = state.conversationsState.withUpdatedConversation(conversationId) {
                     copy(
                         lastMessage = quickReply,
-                        lastUpdatedAt = now.toRelativeTimestampLabel(),
-                        lastUpdatedAtEpochMillis = now,
+                        lastUpdatedAt = createdAtEpochMillis.toRelativeTimestampLabel(),
+                        lastUpdatedAtEpochMillis = createdAtEpochMillis,
                     )
                 },
-            )
-        }
-        pendingMutationConversationById[clientMutationId] = conversationId
-        mutationAckTimeoutJobs.remove(clientMutationId)?.cancel()
-        mutationAckTimeoutJobs[clientMutationId] =
-            viewModelScope.launch {
-                delay(MUTATION_ACK_TIMEOUT_MS)
-                markMutationSendFailed(clientMutationId)
-            }
-    }
-
-    fun markMutationSendFailed(clientMutationId: String) {
-        mutationAckTimeoutJobs.remove(clientMutationId)?.cancel()
-        val conversationId = pendingMutationConversationById.remove(clientMutationId) ?: return
-        _uiState.update { state ->
-            val pendingAfterFailure = (state.pendingMutations - 1).coerceAtLeast(0)
-            val updatedMessages =
-                state.messagesByConversation[conversationId]
-                    .orEmpty()
-                    .map { message ->
-                        if (message.id == clientMutationId) {
-                            message.copy(
-                                status = MessageStatus.Failed,
-                                localVersion = message.localVersion + 1,
-                            )
-                        } else {
-                            message
-                        }
-                    }
-            state.copy(
-                pendingMutations = pendingAfterFailure,
-                syncStatus = SyncStatus.OfflineQueue,
-                messagesByConversation =
-                    state.messagesByConversation + (conversationId to updatedMessages),
             )
         }
     }
 
     fun markConversationRead(conversationId: String) {
+        var shouldSendMutation = false
         _uiState.update { state ->
+            val conversationHasUnread =
+                (state.conversationsState as? ConversationsUiState.Success)
+                    ?.conversations
+                    ?.firstOrNull { conversation -> conversation.id == conversationId }
+                    ?.unreadCount
+                    ?.let { unread -> unread > 0 } == true
+            val messagesContainUnread =
+                state.messagesByConversation[conversationId]
+                    .orEmpty()
+                    .any { message -> !message.outgoing && message.status != MessageStatus.Read }
+            shouldSendMutation = conversationHasUnread || messagesContainUnread
             state.copy(
                 conversationsState = state.conversationsState.withUpdatedConversation(conversationId) {
                     copy(unreadCount = 0)
@@ -253,10 +264,22 @@ class MessagingViewModel(
                         }),
             )
         }
+        if (shouldSendMutation) {
+            queueAndSendMutation(
+                type = WatchMutationType.MARK_READ,
+                conversationId = conversationId,
+            )
+        }
     }
 
     fun archiveConversation(conversationId: String) {
+        var hadConversation = false
         _uiState.update { state ->
+            val existingConversations =
+                (state.conversationsState as? ConversationsUiState.Success)
+                    ?.conversations
+                    .orEmpty()
+            hadConversation = existingConversations.any { conversation -> conversation.id == conversationId }
             val updatedConversations =
                 state.conversationsState.withConversationList { conversations ->
                     conversations.filterNot { it.id == conversationId }
@@ -267,17 +290,176 @@ class MessagingViewModel(
                 conversationsState = updatedConversations,
             )
         }
-    }
-
-    fun toggleConversationMute(conversationId: String) {
-        _uiState.update { state ->
-            state.copy(
-                conversationsState = state.conversationsState.withUpdatedConversation(conversationId) {
-                    copy(muted = !muted)
-                }
+        if (hadConversation) {
+            queueAndSendMutation(
+                type = WatchMutationType.ARCHIVE,
+                conversationId = conversationId,
             )
         }
     }
+
+    fun toggleConversationMute(conversationId: String) {
+        var targetMutedState: Boolean? = null
+        _uiState.update { state ->
+            state.copy(
+                conversationsState = state.conversationsState.withUpdatedConversation(conversationId) {
+                    val toggled = !muted
+                    targetMutedState = toggled
+                    copy(muted = toggled)
+                }
+            )
+        }
+        val mutationType =
+            when (targetMutedState) {
+                true -> WatchMutationType.MUTE
+                false -> WatchMutationType.UNMUTE
+                null -> null
+            }
+        if (mutationType != null) {
+            queueAndSendMutation(
+                type = mutationType,
+                conversationId = conversationId,
+            )
+        }
+    }
+
+    private fun enqueueMutationForDelivery(mutation: WatchMutation) {
+        pendingMutationIds.add(mutation.clientMutationId)
+        pendingMutationConversationById[mutation.clientMutationId] = mutation.conversationId
+        pendingMutationById.putIfAbsent(
+            mutation.clientMutationId,
+            PendingMutationRecord(
+                mutation = mutation,
+                attemptCount = 0,
+                nextRetryAtEpochMillis = System.currentTimeMillis(),
+                awaitingAck = false,
+            ),
+        )
+        _uiState.update { state ->
+            state.copy(
+                pendingMutations = pendingMutationIds.size,
+                syncStatus = SyncStatus.Syncing,
+            )
+        }
+        viewModelScope.launch {
+            dispatchMutationIfDue(mutation.clientMutationId, force = true)
+        }
+    }
+
+    private suspend fun dispatchMutationIfDue(
+        clientMutationId: String,
+        force: Boolean = false,
+    ) {
+        val now = System.currentTimeMillis()
+        val record =
+            synchronized(pendingMutationById) {
+                pendingMutationById[clientMutationId]
+            } ?: return
+        if (record.awaitingAck) return
+        if (!force && now < record.nextRetryAtEpochMillis) return
+
+        val sent = syncTransport.sendWatchMutation(record.mutation)
+        if (sent) {
+            synchronized(pendingMutationById) {
+                pendingMutationById[clientMutationId] = record.copy(awaitingAck = true)
+            }
+            scheduleMutationAckTimeout(clientMutationId)
+            _uiState.update { state ->
+                state.copy(
+                    pendingMutations = pendingMutationIds.size,
+                    syncStatus = SyncStatus.Syncing,
+                )
+            }
+        } else {
+            markMutationForRetry(clientMutationId, nextAttemptCount = record.attemptCount + 1)
+        }
+    }
+
+    private fun scheduleMutationAckTimeout(clientMutationId: String) {
+        mutationAckTimeoutJobs.remove(clientMutationId)?.cancel()
+        mutationAckTimeoutJobs[clientMutationId] =
+            viewModelScope.launch {
+                delay(MUTATION_ACK_TIMEOUT_MS)
+                val record =
+                    synchronized(pendingMutationById) {
+                        pendingMutationById[clientMutationId]
+                    } ?: return@launch
+                if (!record.awaitingAck) return@launch
+                markMutationForRetry(clientMutationId, nextAttemptCount = record.attemptCount + 1)
+            }
+    }
+
+    private fun markMutationForRetry(
+        clientMutationId: String,
+        nextAttemptCount: Int,
+    ) {
+        mutationAckTimeoutJobs.remove(clientMutationId)?.cancel()
+        synchronized(pendingMutationById) {
+            val existing = pendingMutationById[clientMutationId] ?: return
+            pendingMutationById[clientMutationId] =
+                existing.copy(
+                    attemptCount = nextAttemptCount,
+                    nextRetryAtEpochMillis = System.currentTimeMillis() + retryBackoffMillis(nextAttemptCount),
+                    awaitingAck = false,
+                )
+        }
+        _uiState.update { state ->
+            state.copy(
+                pendingMutations = pendingMutationIds.size,
+                syncStatus = SyncStatus.OfflineQueue,
+            )
+        }
+    }
+
+    private fun observeMutationOutbox() {
+        outboxRetryJob?.cancel()
+        outboxRetryJob =
+            viewModelScope.launch {
+                while (isActive) {
+                    val dueMutationIds =
+                        synchronized(pendingMutationById) {
+                            val now = System.currentTimeMillis()
+                            pendingMutationById.values
+                                .asSequence()
+                                .filter { record -> !record.awaitingAck && record.nextRetryAtEpochMillis <= now }
+                                .sortedBy { record -> record.nextRetryAtEpochMillis }
+                                .map { record -> record.mutation.clientMutationId }
+                                .toList()
+                        }
+                    dueMutationIds.forEach { clientMutationId ->
+                        dispatchMutationIfDue(clientMutationId, force = true)
+                    }
+                    delay(MUTATION_OUTBOX_TICK_MS)
+                }
+            }
+    }
+
+    private fun queueAndSendMutation(
+        type: WatchMutationType,
+        conversationId: String,
+        messageBody: String? = null,
+    ) {
+        enqueueMutationForDelivery(
+            WatchMutation(
+                clientMutationId = newMutationId(),
+                type = type,
+                conversationId = conversationId,
+                messageBody = messageBody,
+                recipientAddresses = recipientAddressesForConversation(conversationId),
+                createdAtEpochMillis = System.currentTimeMillis(),
+            )
+        )
+    }
+
+    private fun recipientAddressesForConversation(conversationId: String): List<String> =
+        (_uiState.value.conversationsState as? ConversationsUiState.Success)
+            ?.conversations
+            ?.firstOrNull { conversation -> conversation.id == conversationId }
+            ?.participants
+            .orEmpty()
+            .map { participant -> participant.normalizedPhoneNumber() }
+            .filter { participant -> participant.isNotBlank() && participant.any(Char::isDigit) }
+            .distinct()
 
     fun toggleHaptics(enabled: Boolean) {
         updateSettings { it.copy(hapticsEnabled = enabled) }
@@ -332,7 +514,14 @@ class MessagingViewModel(
             val restoredFromCache = restoreCachedData()
             _uiState.update {
                 if (restoredFromCache) {
-                    it.copy(syncStatus = SyncStatus.Syncing)
+                    it.copy(
+                        syncStatus =
+                            if (it.pendingMutations > 0) {
+                                SyncStatus.OfflineQueue
+                            } else {
+                                SyncStatus.Syncing
+                            }
+                    )
                 } else {
                     it.copy(
                         conversationsState = ConversationsUiState.Loading,
@@ -380,6 +569,25 @@ class MessagingViewModel(
             withContext(Dispatchers.IO) {
                 secureCache.load()
             } ?: return false
+        val restoredPendingById =
+            snapshot.pendingMutations
+                .mapNotNull { cached -> cached.toPendingMutationRecordOrNull() }
+                .associateBy { record -> record.mutation.clientMutationId }
+        synchronized(pendingMutationById) {
+            pendingMutationById.clear()
+            pendingMutationById.putAll(restoredPendingById)
+        }
+        pendingMutationIds.clear()
+        pendingMutationIds.addAll(restoredPendingById.keys)
+        pendingMutationConversationById.clear()
+        restoredPendingById.values.forEach { record ->
+            pendingMutationConversationById[record.mutation.clientMutationId] = record.mutation.conversationId
+        }
+        restoredPendingById.values
+            .filter { record -> record.awaitingAck }
+            .forEach { record ->
+                scheduleMutationAckTimeout(record.mutation.clientMutationId)
+            }
         _uiState.update {
             val conversations =
                 snapshot.conversations
@@ -413,12 +621,15 @@ class MessagingViewModel(
                                 senderName = cached.senderName,
                                 body = cached.body,
                                 timestamp = cached.timestamp,
+                                timestampEpochMillis = cached.timestampEpochMillis,
                                 status = cached.status.toMessageStatusSafe(),
                                 localVersion = cached.localVersion,
                                 outgoing = cached.outgoing,
                             )
                         }
+                            .sortedWith(compareBy<Message>({ it.timestampEpochMillis }, { it.id }))
                     }
+            val restoredPendingCount = pendingMutationIds.size
 
             it.copy(
                 conversationsState =
@@ -428,10 +639,13 @@ class MessagingViewModel(
                         ConversationsUiState.Success(conversations)
                     },
                 messagesByConversation = messagesByConversation,
-                syncStatus = SyncStatus.Idle,
+                pendingMutations = restoredPendingCount,
+                syncStatus = if (restoredPendingCount > 0) SyncStatus.OfflineQueue else SyncStatus.Idle,
             )
         }
-        return snapshot.conversations.isNotEmpty() || snapshot.messages.isNotEmpty()
+        return snapshot.conversations.isNotEmpty() ||
+            snapshot.messages.isNotEmpty() ||
+            snapshot.pendingMutations.isNotEmpty()
     }
 
     private fun restoreSettings() {
@@ -469,7 +683,25 @@ class MessagingViewModel(
                             delay(CACHE_PERSIST_DEBOUNCE_MS)
                             val snapshot =
                                 withContext(Dispatchers.Default) {
-                                    state.toCachedSyncSnapshotOrNull()
+                                    state.toCachedSyncSnapshotOrNull(
+                                        pendingMutations =
+                                            synchronized(pendingMutationById) {
+                                                pendingMutationById.values
+                                                    .map { record ->
+                                                        CachedPendingMutation(
+                                                            clientMutationId = record.mutation.clientMutationId,
+                                                            type = record.mutation.type.name,
+                                                            conversationId = record.mutation.conversationId,
+                                                            messageBody = record.mutation.messageBody,
+                                                            recipientAddresses = record.mutation.recipientAddresses,
+                                                            createdAtEpochMillis = record.mutation.createdAtEpochMillis,
+                                                            attemptCount = record.attemptCount,
+                                                            nextRetryAtEpochMillis = record.nextRetryAtEpochMillis,
+                                                            awaitingAck = record.awaitingAck,
+                                                        )
+                                                    }
+                                            }
+                                    )
                                 } ?: return@launch
                             withContext(Dispatchers.IO) {
                                 runCatching {
@@ -599,8 +831,6 @@ class MessagingViewModel(
         hasReceivedSyncPayload = true
         syncTimeoutJob?.cancel()
         latestConversationBatchCursor = batch.cursor
-        lastConversationSnapshotCursor = batch.cursor
-        lastConversationSnapshotIds = batch.conversations.map { it.id }.toSet()
         _uiState.update { state ->
             val mergedById =
                 mutableMapOf<String, Conversation>().apply {
@@ -665,15 +895,15 @@ class MessagingViewModel(
         hasReceivedSyncPayload = true
         syncTimeoutJob?.cancel()
         latestMessageBatchCursor = batch.cursor
-        val snapshotConversationIds =
-            if (batch.cursor == lastConversationSnapshotCursor) {
-                lastConversationSnapshotIds
-            } else {
-                emptySet()
-            }
         _uiState.update { state ->
             val deletedMessageIds = batch.deletedMessageIds.toHashSet()
             val groupedMessages = batch.messages.groupBy { it.conversationId }
+            val snapshotConversationIds =
+                if (batch.conversationIds.isNotEmpty()) {
+                    batch.conversationIds.toSet()
+                } else {
+                    groupedMessages.keys
+                }
             val participantsByConversationId =
                 (state.conversationsState as? ConversationsUiState.Success)
                     ?.conversations
@@ -689,8 +919,8 @@ class MessagingViewModel(
                     .toMutableMap()
             val conversationIdsToProcess =
                 linkedSetOf<String>().apply {
-                    addAll(groupedMessages.keys)
                     addAll(snapshotConversationIds)
+                    addAll(groupedMessages.keys)
                 }
 
             conversationIdsToProcess.forEach { conversationId ->
@@ -727,6 +957,7 @@ class MessagingViewModel(
                                         },
                                     body = sync.body,
                                     timestamp = sync.timestampEpochMillis.toClockLabel(),
+                                    timestampEpochMillis = sync.timestampEpochMillis,
                                     status = sync.status.toMessageStatus(),
                                     localVersion = sync.localVersion,
                                     outgoing = isOutgoing,
@@ -757,8 +988,17 @@ class MessagingViewModel(
     private fun applyMutationAck(ack: com.wapp.wearmessage.sync.contract.MutationAck) {
         syncTimeoutJob?.cancel()
         mutationAckTimeoutJobs.remove(ack.clientMutationId)?.cancel()
+        synchronized(pendingMutationById) {
+            pendingMutationById.remove(ack.clientMutationId)
+        }
         _uiState.update { state ->
-            val conversationId = pendingMutationConversationById.remove(ack.clientMutationId)
+            val wasPending = pendingMutationIds.remove(ack.clientMutationId)
+            val conversationId =
+                pendingMutationConversationById.remove(ack.clientMutationId)
+                    ?: findConversationIdByMessageId(
+                        state = state,
+                        mutationId = ack.clientMutationId,
+                    )
             val updatedMessagesByConversation =
                 if (conversationId == null) {
                     state.messagesByConversation
@@ -779,10 +1019,10 @@ class MessagingViewModel(
                     state.messagesByConversation + (conversationId to updatedMessages)
                 }
             val pendingAfterAck =
-                if (conversationId == null) {
-                    state.pendingMutations
+                if (wasPending) {
+                    pendingMutationIds.size
                 } else {
-                    (state.pendingMutations - 1).coerceAtLeast(0)
+                    pendingMutationIds.size
                 }
             state.copy(
                 pendingMutations = pendingAfterAck,
@@ -791,8 +1031,6 @@ class MessagingViewModel(
                         SyncStatus.OfflineQueue
                     } else if (pendingAfterAck > 0) {
                         SyncStatus.Syncing
-                    } else if (state.syncStatus == SyncStatus.OfflineQueue) {
-                        SyncStatus.OfflineQueue
                     } else {
                         SyncStatus.Idle
                     },
@@ -804,11 +1042,14 @@ class MessagingViewModel(
     override fun onCleared() {
         persistCacheJob?.cancel()
         syncTimeoutJob?.cancel()
+        outboxRetryJob?.cancel()
         mutationAckTimeoutJobs.values.forEach { it.cancel() }
         mutationAckTimeoutJobs.clear()
+        pendingMutationIds.clear()
         pendingMutationConversationById.clear()
-        lastConversationSnapshotCursor = null
-        lastConversationSnapshotIds = emptySet()
+        synchronized(pendingMutationById) {
+            pendingMutationById.clear()
+        }
         latestConversationBatchCursor = Long.MIN_VALUE
         latestMessageBatchCursor = Long.MIN_VALUE
         super.onCleared()
@@ -830,6 +1071,39 @@ class MessagingViewModel(
                 }
             }
     }
+
+    private fun findConversationIdByMessageId(
+        state: WearMessagingUiState,
+        mutationId: String,
+    ): String? =
+        state.messagesByConversation.entries.firstOrNull { (_, messages) ->
+            messages.any { message -> message.id == mutationId }
+        }?.key
+}
+
+private data class PendingMutationRecord(
+    val mutation: WatchMutation,
+    val attemptCount: Int,
+    val nextRetryAtEpochMillis: Long,
+    val awaitingAck: Boolean,
+)
+
+private fun CachedPendingMutation.toPendingMutationRecordOrNull(): PendingMutationRecord? {
+    val parsedType = runCatching { WatchMutationType.valueOf(type) }.getOrNull() ?: return null
+    return PendingMutationRecord(
+        mutation =
+            WatchMutation(
+                clientMutationId = clientMutationId,
+                type = parsedType,
+                conversationId = conversationId,
+                messageBody = messageBody,
+                recipientAddresses = recipientAddresses,
+                createdAtEpochMillis = createdAtEpochMillis,
+            ),
+        attemptCount = attemptCount.coerceAtLeast(0),
+        nextRetryAtEpochMillis = nextRetryAtEpochMillis.coerceAtLeast(0L),
+        awaitingAck = awaitingAck,
+    )
 }
 
 private fun ConversationsUiState.withConversationList(
@@ -986,7 +1260,9 @@ private fun String.toMessageStatusSafe(): MessageStatus =
     runCatching { MessageStatus.valueOf(this) }
         .getOrDefault(MessageStatus.Sent)
 
-private fun WearMessagingUiState.toCachedSyncSnapshotOrNull(): CachedSyncSnapshot? {
+private fun WearMessagingUiState.toCachedSyncSnapshotOrNull(
+    pendingMutations: List<CachedPendingMutation>,
+): CachedSyncSnapshot? {
     if (conversationsState is ConversationsUiState.Loading) {
         return null
     }
@@ -1018,7 +1294,7 @@ private fun WearMessagingUiState.toCachedSyncSnapshotOrNull(): CachedSyncSnapsho
             }
             .flatten()
             .sortedWith(
-                compareBy<Message>({ it.conversationId }, { it.id })
+                compareBy<Message>({ it.conversationId }, { it.timestampEpochMillis }, { it.id })
             )
             .let { sortedMessages ->
                 if (sortedMessages.size <= MAX_MESSAGES_TOTAL_CACHE) {
@@ -1035,6 +1311,7 @@ private fun WearMessagingUiState.toCachedSyncSnapshotOrNull(): CachedSyncSnapsho
                     senderName = message.senderName,
                     body = message.body,
                     timestamp = message.timestamp,
+                    timestampEpochMillis = message.timestampEpochMillis,
                     status = message.status.name,
                     localVersion = message.localVersion,
                     outgoing = message.outgoing,
@@ -1044,6 +1321,7 @@ private fun WearMessagingUiState.toCachedSyncSnapshotOrNull(): CachedSyncSnapsho
     return CachedSyncSnapshot(
         conversations = conversations,
         messages = messages,
+        pendingMutations = pendingMutations,
     )
 }
 
@@ -1076,9 +1354,18 @@ private fun Long.toClockLabel(): String {
     }
 }
 
+private fun retryBackoffMillis(attemptCount: Int): Long {
+    val boundedAttempts = attemptCount.coerceIn(1, 6)
+    val multiplier = 1L shl (boundedAttempts - 1)
+    return (MUTATION_RETRY_BASE_DELAY_MS * multiplier).coerceAtMost(MUTATION_RETRY_MAX_DELAY_MS)
+}
+
 private const val CACHE_PERSIST_DEBOUNCE_MS = 500L
 private const val SYNC_REQUEST_TIMEOUT_MS = 12_000L
 private const val MUTATION_ACK_TIMEOUT_MS = 15_000L
+private const val MUTATION_OUTBOX_TICK_MS = 3_000L
+private const val MUTATION_RETRY_BASE_DELAY_MS = 2_000L
+private const val MUTATION_RETRY_MAX_DELAY_MS = 60_000L
 private const val MAX_CONVERSATIONS_IN_MEMORY = 300
 private const val MAX_MESSAGES_PER_CONVERSATION_IN_MEMORY = 250
 private const val MAX_MESSAGES_PER_CONVERSATION_CACHE = 120

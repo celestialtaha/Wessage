@@ -16,7 +16,7 @@ sealed interface SyncInboundEvent {
 object WearSyncBus {
     private val _events =
         MutableSharedFlow<SyncInboundEvent>(
-            replay = 32,
+            replay = 0,
             extraBufferCapacity = 64,
             onBufferOverflow = BufferOverflow.DROP_OLDEST,
         )

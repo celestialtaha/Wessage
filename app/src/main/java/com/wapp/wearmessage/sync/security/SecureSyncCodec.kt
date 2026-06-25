@@ -1,15 +1,20 @@
 package com.wapp.wearmessage.sync.security
 
+import android.annotation.SuppressLint
 import android.content.Context
+import android.security.keystore.KeyGenParameterSpec
+import android.security.keystore.KeyProperties
 import android.util.Base64
+import androidx.core.content.edit
 import org.json.JSONObject
 import java.security.KeyFactory
 import java.security.KeyPair
 import java.security.KeyPairGenerator
+import java.security.KeyStore
+import java.security.PrivateKey
 import java.security.PublicKey
 import java.security.SecureRandom
 import java.security.spec.ECGenParameterSpec
-import java.security.spec.PKCS8EncodedKeySpec
 import java.security.spec.X509EncodedKeySpec
 import javax.crypto.Cipher
 import javax.crypto.KeyAgreement
@@ -94,6 +99,17 @@ class SecureSyncCodec(
         path: String,
         envelopePayload: ByteArray,
     ): ByteArray? =
+        when (val result = decryptEnvelope(sourceNodeId, path, envelopePayload)) {
+            is DecryptResult.Success -> result.payload
+            DecryptResult.Failed,
+            DecryptResult.Stale -> null
+        }
+
+    fun decryptEnvelope(
+        sourceNodeId: String,
+        path: String,
+        envelopePayload: ByteArray,
+    ): DecryptResult =
         runCatching {
             val envelope = JSONObject(envelopePayload.toString(Charsets.UTF_8))
             val senderDeviceId = envelope.getString("senderDeviceId")
@@ -105,18 +121,17 @@ class SecureSyncCodec(
 
             val storedPeer = getPeerPublicKey(sourceNodeId)
             if (storedPeer != null && storedPeer != senderPublicB64) {
-                return null
+                return DecryptResult.Failed
             }
             if (storedPeer == null) {
                 storePeerPublicKey(sourceNodeId, senderPublicB64, senderDeviceId)
             }
 
-            val lastCounter = getLastReceivedCounter(senderDeviceId)
-            if (counter <= lastCounter) {
-                return null
+            if (isReceivedCounterStale(senderDeviceId, counter)) {
+                return DecryptResult.Stale
             }
 
-            val senderPublic = senderPublicB64.toPublicKey() ?: return null
+            val senderPublic = senderPublicB64.toPublicKey() ?: return DecryptResult.Failed
             val secret =
                 getOrDeriveSessionKey(
                     cacheKey = "rx|$sourceNodeId|$senderPublicB64",
@@ -128,35 +143,46 @@ class SecureSyncCodec(
             cipher.init(Cipher.DECRYPT_MODE, secret, GCMParameterSpec(GCM_TAG_BITS, nonce))
             cipher.updateAAD(aad)
             val plain = cipher.doFinal(ciphertext)
-            setLastReceivedCounter(senderDeviceId, counter)
-            plain
-        }.getOrNull()
+            recordReceivedCounter(senderDeviceId, counter)
+            DecryptResult.Success(plain)
+        }.getOrDefault(DecryptResult.Failed)
 
+    @SuppressLint("InlinedApi")
     private fun getOrCreateLocalKeyPair(): KeyPair {
-        val storedPrivate = prefs.getString(KEY_PRIVATE, null)
-        val storedPublic = prefs.getString(KEY_PUBLIC, null)
-        if (!storedPrivate.isNullOrBlank() && !storedPublic.isNullOrBlank()) {
-            val keyFactory = KeyFactory.getInstance(KEY_ALGO)
-            val privateKey = keyFactory.generatePrivate(PKCS8EncodedKeySpec(storedPrivate.fromB64()))
-            val publicKey = keyFactory.generatePublic(X509EncodedKeySpec(storedPublic.fromB64()))
-            return KeyPair(publicKey, privateKey)
+        val keyStore =
+            KeyStore.getInstance(ANDROID_KEYSTORE).apply {
+                load(null)
+            }
+        val existingPair =
+            runCatching {
+                val existingPrivate = keyStore.getKey(KEY_ALIAS, null) as? PrivateKey
+                val existingPublic = keyStore.getCertificate(KEY_ALIAS)?.publicKey
+                if (existingPrivate != null && existingPublic != null) {
+                    KeyPair(existingPublic, existingPrivate)
+                } else {
+                    null
+                }
+            }.getOrNull()
+        if (existingPair != null) {
+            return existingPair
         }
+        runCatching { keyStore.deleteEntry(KEY_ALIAS) }
 
-        val generator = KeyPairGenerator.getInstance(KEY_ALGO)
-        generator.initialize(ECGenParameterSpec(CURVE_NAME))
-        val generated = generator.generateKeyPair()
-        prefs.edit()
-            .putString(KEY_PRIVATE, generated.private.encoded.toB64())
-            .putString(KEY_PUBLIC, generated.public.encoded.toB64())
-            .apply()
-        return generated
+        val generator = KeyPairGenerator.getInstance(KEY_ALGO, ANDROID_KEYSTORE)
+        val spec =
+            KeyGenParameterSpec
+                .Builder(KEY_ALIAS, KeyProperties.PURPOSE_AGREE_KEY)
+                .setAlgorithmParameterSpec(ECGenParameterSpec(CURVE_NAME))
+                .build()
+        generator.initialize(spec)
+        return generator.generateKeyPair()
     }
 
     private fun getOrCreateDeviceId(): String {
         val existing = prefs.getString(KEY_DEVICE_ID, null)
         if (!existing.isNullOrBlank()) return existing
         val generated = java.util.UUID.randomUUID().toString()
-        prefs.edit().putString(KEY_DEVICE_ID, generated).apply()
+        prefs.edit { putString(KEY_DEVICE_ID, generated) }
         return generated
     }
 
@@ -168,38 +194,63 @@ class SecureSyncCodec(
         publicKeyB64: String,
         peerDeviceId: String,
     ) {
-        prefs.edit()
-            .putString(peerPublicKeyPref(nodeId), publicKeyB64)
-            .putString(peerDeviceIdPref(nodeId), peerDeviceId)
-            .apply()
+        prefs.edit {
+            putString(peerPublicKeyPref(nodeId), publicKeyB64)
+            putString(peerDeviceIdPref(nodeId), peerDeviceId)
+        }
         evictCachedSessionKeys(nodeId)
     }
 
     private fun nextCounter(nodeId: String): Long {
         val key = sentCounterPref(nodeId)
         val next = prefs.getLong(key, 0L) + 1L
-        prefs.edit().putLong(key, next).apply()
+        prefs.edit { putLong(key, next) }
         return next
     }
 
-    private fun getLastReceivedCounter(senderDeviceId: String): Long =
+    private fun getReceivedCounterHighWatermark(senderDeviceId: String): Long =
         prefs.getLong(receivedCounterPref(senderDeviceId), 0L)
 
-    private fun setLastReceivedCounter(
+    private fun isReceivedCounterStale(
+        senderDeviceId: String,
+        counter: Long,
+    ): Boolean {
+        val highWatermark = getReceivedCounterHighWatermark(senderDeviceId)
+        if (counter <= highWatermark - RECEIVED_COUNTER_WINDOW_SIZE) return true
+        return prefs
+            .getStringSet(receivedCounterSetPref(senderDeviceId), emptySet())
+            .orEmpty()
+            .contains(counter.toString())
+    }
+
+    private fun recordReceivedCounter(
         senderDeviceId: String,
         counter: Long,
     ) {
-        prefs.edit().putLong(receivedCounterPref(senderDeviceId), counter).apply()
+        val highWatermark = maxOf(getReceivedCounterHighWatermark(senderDeviceId), counter)
+        val minimumCounter = (highWatermark - RECEIVED_COUNTER_WINDOW_SIZE).coerceAtLeast(0L)
+        val counters =
+            prefs
+                .getStringSet(receivedCounterSetPref(senderDeviceId), emptySet())
+                .orEmpty()
+                .asSequence()
+                .mapNotNull { value -> value.toLongOrNull() }
+                .plus(counter)
+                .filter { value -> value > minimumCounter }
+                .map { value -> value.toString() }
+                .toSet()
+        prefs.edit {
+            putLong(receivedCounterPref(senderDeviceId), highWatermark)
+            putStringSet(receivedCounterSetPref(senderDeviceId), counters)
+        }
     }
 
     private fun deriveSessionKey(
-        localPrivatePkcs8: ByteArray,
+        localPrivateKey: PrivateKey,
         remotePublicKey: PublicKey,
     ): SecretKeySpec {
-        val keyFactory = KeyFactory.getInstance(KEY_ALGO)
-        val privateKey = keyFactory.generatePrivate(PKCS8EncodedKeySpec(localPrivatePkcs8))
         val keyAgreement = KeyAgreement.getInstance(ECDH_ALGO)
-        keyAgreement.init(privateKey)
+        keyAgreement.init(localPrivateKey)
         keyAgreement.doPhase(remotePublicKey, true)
         val shared = keyAgreement.generateSecret()
         val prk = hmac(SALT, shared)
@@ -214,7 +265,7 @@ class SecureSyncCodec(
         synchronized(sessionKeyCache) {
             sessionKeyCache[cacheKey]?.let { return it }
         }
-        val derived = deriveSessionKey(localKeys.private.encoded, remotePublicKey)
+        val derived = deriveSessionKey(localKeys.private, remotePublicKey)
         synchronized(sessionKeyCache) {
             sessionKeyCache[cacheKey] = derived
         }
@@ -288,12 +339,13 @@ class SecureSyncCodec(
     private fun peerDeviceIdPref(nodeId: String) = "peer_device_${nodeId.safeKey()}"
     private fun sentCounterPref(nodeId: String) = "sent_counter_${nodeId.safeKey()}"
     private fun receivedCounterPref(deviceId: String) = "rx_counter_${deviceId.safeKey()}"
+    private fun receivedCounterSetPref(deviceId: String) = "rx_counter_set_${deviceId.safeKey()}"
     private fun String.safeKey(): String = replace("[^a-zA-Z0-9_]".toRegex(), "_")
 
     private companion object {
         private const val PREFS_NAME = "wessage_secure_sync"
-        private const val KEY_PRIVATE = "local_private"
-        private const val KEY_PUBLIC = "local_public"
+        private const val KEY_ALIAS = "wessage.sync.ecdh.key.v1"
+        private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val KEY_DEVICE_ID = "local_device_id"
         private const val KEY_ALGO = "EC"
         private const val ECDH_ALGO = "ECDH"
@@ -305,7 +357,14 @@ class SecureSyncCodec(
         private const val ENVELOPE_VERSION = 1
         private const val KID = "ec-p256-v1"
         private const val SESSION_KEY_CACHE_SIZE = 24
+        private const val RECEIVED_COUNTER_WINDOW_SIZE = 64L
         private val SALT = "wessage-sync-salt-v1".toByteArray(Charsets.UTF_8)
         private val INFO = "wessage-sync-aes256-gcm-v1".toByteArray(Charsets.UTF_8)
     }
+}
+
+sealed interface DecryptResult {
+    data class Success(val payload: ByteArray) : DecryptResult
+    data object Stale : DecryptResult
+    data object Failed : DecryptResult
 }

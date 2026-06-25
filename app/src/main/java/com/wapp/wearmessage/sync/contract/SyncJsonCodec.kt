@@ -19,6 +19,7 @@ object SyncJsonCodec {
             .put("type", mutation.type.name)
             .put("conversationId", mutation.conversationId)
             .put("messageBody", mutation.messageBody)
+            .put("recipientAddresses", mutation.recipientAddresses.toJsonArray())
             .put("createdAtEpochMillis", mutation.createdAtEpochMillis)
             .toString()
             .toByteArray(Charsets.UTF_8)
@@ -26,8 +27,12 @@ object SyncJsonCodec {
     fun decodeMutationAck(bytes: ByteArray): MutationAck? =
         runCatching {
             val json = JSONObject(bytes.toString(Charsets.UTF_8))
+            val schemaVersion = json.getInt("schemaVersion")
+            if (schemaVersion != SYNC_SCHEMA_VERSION) {
+                return null
+            }
             MutationAck(
-                schemaVersion = json.optInt("schemaVersion", SYNC_SCHEMA_VERSION),
+                schemaVersion = schemaVersion,
                 clientMutationId = json.getString("clientMutationId"),
                 accepted = json.getBoolean("accepted"),
                 serverVersion = json.getLong("serverVersion"),
@@ -38,13 +43,17 @@ object SyncJsonCodec {
     fun decodeConversationDeltaBatch(bytes: ByteArray): ConversationDeltaBatch? =
         runCatching {
             val json = JSONObject(bytes.toString(Charsets.UTF_8))
+            val schemaVersion = json.getInt("schemaVersion")
+            if (schemaVersion != SYNC_SCHEMA_VERSION) {
+                return null
+            }
             val conversations =
-                json.optJSONArray("conversations").toSyncConversations()
+                json.getJSONArray("conversations").toSyncConversations()
             val deleted =
                 json.optJSONArray("deletedConversationIds").toStringList()
 
             ConversationDeltaBatch(
-                schemaVersion = json.optInt("schemaVersion", SYNC_SCHEMA_VERSION),
+                schemaVersion = schemaVersion,
                 cursor = json.getLong("cursor"),
                 generatedAtEpochMillis = json.getLong("generatedAtEpochMillis"),
                 conversations = conversations,
@@ -55,13 +64,19 @@ object SyncJsonCodec {
     fun decodeMessageDeltaBatch(bytes: ByteArray): MessageDeltaBatch? =
         runCatching {
             val json = JSONObject(bytes.toString(Charsets.UTF_8))
-            val messages = json.optJSONArray("messages").toSyncMessages()
+            val schemaVersion = json.getInt("schemaVersion")
+            if (schemaVersion != SYNC_SCHEMA_VERSION) {
+                return null
+            }
+            val messages = json.getJSONArray("messages").toSyncMessages()
+            val conversationIds = json.getJSONArray("conversationIds").toStringList()
             val deleted = json.optJSONArray("deletedMessageIds").toStringList()
             MessageDeltaBatch(
-                schemaVersion = json.optInt("schemaVersion", SYNC_SCHEMA_VERSION),
+                schemaVersion = schemaVersion,
                 cursor = json.getLong("cursor"),
                 generatedAtEpochMillis = json.getLong("generatedAtEpochMillis"),
                 messages = messages,
+                conversationIds = conversationIds,
                 deletedMessageIds = deleted,
             )
         }.getOrNull()
@@ -105,6 +120,9 @@ object SyncJsonCodec {
             optString(index).takeIf { it.isNotBlank() }
         }
     }
+
+    private fun List<String>.toJsonArray(): JSONArray =
+        JSONArray().also { array -> forEach { array.put(it) } }
 
     private fun String.toSyncStatus(): SyncMessageStatus =
         runCatching { SyncMessageStatus.valueOf(this) }.getOrElse { SyncMessageStatus.SENT }

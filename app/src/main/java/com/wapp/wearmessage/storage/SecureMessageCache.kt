@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import androidx.core.content.edit
 import org.json.JSONArray
 import org.json.JSONObject
 import java.nio.ByteBuffer
@@ -31,13 +32,13 @@ class SecureMessageCache(
             return
         }
         val encryptedPayload = encrypt(plainPayload) ?: return
-        prefs.edit()
-            .putString(
+        prefs.edit {
+            putString(
                 PREF_KEY_CACHE_BLOB,
                 Base64.encodeToString(encryptedPayload, Base64.NO_WRAP),
             )
-            .putString(PREF_KEY_CACHE_DIGEST, digest)
-            .apply()
+            putString(PREF_KEY_CACHE_DIGEST, digest)
+        }
         lastSavedDigest = digest
     }
 
@@ -57,10 +58,10 @@ class SecureMessageCache(
     }
 
     private fun clearAndNull(): CachedSyncSnapshot? {
-        prefs.edit()
-            .remove(PREF_KEY_CACHE_BLOB)
-            .remove(PREF_KEY_CACHE_DIGEST)
-            .apply()
+        prefs.edit {
+            remove(PREF_KEY_CACHE_BLOB)
+            remove(PREF_KEY_CACHE_DIGEST)
+        }
         lastSavedDigest = null
         return null
     }
@@ -131,6 +132,7 @@ class SecureMessageCache(
 data class CachedSyncSnapshot(
     val conversations: List<CachedConversation>,
     val messages: List<CachedMessage>,
+    val pendingMutations: List<CachedPendingMutation> = emptyList(),
 ) {
     fun toJson(): JSONObject =
         JSONObject()
@@ -165,6 +167,7 @@ data class CachedSyncSnapshot(
                                 .put("senderName", message.senderName)
                                 .put("body", message.body)
                                 .put("timestamp", message.timestamp)
+                                .put("timestampEpochMillis", message.timestampEpochMillis)
                                 .put("status", message.status)
                                 .put("localVersion", message.localVersion)
                                 .put("outgoing", message.outgoing)
@@ -172,9 +175,28 @@ data class CachedSyncSnapshot(
                     }
                 },
             )
+            .put(
+                "pendingMutations",
+                JSONArray().apply {
+                    pendingMutations.forEach { mutation ->
+                        put(
+                            JSONObject()
+                                .put("clientMutationId", mutation.clientMutationId)
+                                .put("type", mutation.type)
+                                .put("conversationId", mutation.conversationId)
+                                .put("messageBody", mutation.messageBody)
+                                .put("recipientAddresses", JSONArray(mutation.recipientAddresses))
+                                .put("createdAtEpochMillis", mutation.createdAtEpochMillis)
+                                .put("attemptCount", mutation.attemptCount)
+                                .put("nextRetryAtEpochMillis", mutation.nextRetryAtEpochMillis)
+                                .put("awaitingAck", mutation.awaitingAck)
+                        )
+                    }
+                }
+            )
 
     companion object {
-        private const val SCHEMA_VERSION = 1
+        private const val SCHEMA_VERSION = 2
 
         fun fromJson(json: JSONObject): CachedSyncSnapshot? {
             if (json.optInt("schemaVersion", -1) != SCHEMA_VERSION) return null
@@ -186,16 +208,15 @@ data class CachedSyncSnapshot(
                         val item = conversationsJson.optJSONObject(index) ?: continue
                         add(
                             CachedConversation(
-                                id = item.optString("id"),
-                                title = item.optString("title"),
+                                id = item.getString("id"),
+                                title = item.getString("title"),
                                 participants =
-                                    item.optJSONArray("participants")
-                                        ?.toStringList()
-                                        .orEmpty(),
-                                lastMessage = item.optString("lastMessage"),
-                                lastUpdatedAtEpochMillis = item.optLong("lastUpdatedAtEpochMillis"),
-                                unreadCount = item.optInt("unreadCount"),
-                                muted = item.optBoolean("muted", false),
+                                    item.getJSONArray("participants")
+                                        .toStringList(),
+                                lastMessage = item.getString("lastMessage"),
+                                lastUpdatedAtEpochMillis = item.getLong("lastUpdatedAtEpochMillis"),
+                                unreadCount = item.getInt("unreadCount"),
+                                muted = item.getBoolean("muted"),
                             )
                         )
                     }
@@ -206,15 +227,36 @@ data class CachedSyncSnapshot(
                         val item = messagesJson.optJSONObject(index) ?: continue
                         add(
                             CachedMessage(
-                                id = item.optString("id"),
-                                conversationId = item.optString("conversationId"),
-                                senderId = item.optString("senderId"),
-                                senderName = item.optString("senderName"),
-                                body = item.optString("body"),
-                                timestamp = item.optString("timestamp"),
-                                status = item.optString("status"),
-                                localVersion = item.optInt("localVersion", 0),
-                                outgoing = item.optBoolean("outgoing", false),
+                                id = item.getString("id"),
+                                conversationId = item.getString("conversationId"),
+                                senderId = item.getString("senderId"),
+                                senderName = item.getString("senderName"),
+                                body = item.getString("body"),
+                                timestamp = item.getString("timestamp"),
+                                timestampEpochMillis = item.getLong("timestampEpochMillis"),
+                                status = item.getString("status"),
+                                localVersion = item.getInt("localVersion"),
+                                outgoing = item.getBoolean("outgoing"),
+                            )
+                        )
+                    }
+                }
+            val pendingMutationsJson = json.getJSONArray("pendingMutations")
+            val pendingMutations =
+                buildList {
+                    for (index in 0 until pendingMutationsJson.length()) {
+                        val item = pendingMutationsJson.getJSONObject(index)
+                        add(
+                            CachedPendingMutation(
+                                clientMutationId = item.getString("clientMutationId"),
+                                type = item.getString("type"),
+                                conversationId = item.getString("conversationId"),
+                                messageBody = item.optString("messageBody").takeIf { it.isNotBlank() },
+                                recipientAddresses = item.getJSONArray("recipientAddresses").toStringList(),
+                                createdAtEpochMillis = item.getLong("createdAtEpochMillis"),
+                                attemptCount = item.getInt("attemptCount"),
+                                nextRetryAtEpochMillis = item.getLong("nextRetryAtEpochMillis"),
+                                awaitingAck = item.getBoolean("awaitingAck"),
                             )
                         )
                     }
@@ -222,6 +264,7 @@ data class CachedSyncSnapshot(
             return CachedSyncSnapshot(
                 conversations = conversations,
                 messages = messages,
+                pendingMutations = pendingMutations,
             )
         }
     }
@@ -244,9 +287,22 @@ data class CachedMessage(
     val senderName: String,
     val body: String,
     val timestamp: String,
+    val timestampEpochMillis: Long,
     val status: String,
     val localVersion: Int,
     val outgoing: Boolean,
+)
+
+data class CachedPendingMutation(
+    val clientMutationId: String,
+    val type: String,
+    val conversationId: String,
+    val messageBody: String?,
+    val recipientAddresses: List<String>,
+    val createdAtEpochMillis: Long,
+    val attemptCount: Int,
+    val nextRetryAtEpochMillis: Long,
+    val awaitingAck: Boolean,
 )
 
 private fun JSONArray.toStringList(): List<String> =

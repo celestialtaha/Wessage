@@ -27,6 +27,11 @@ class WearSyncTransport(
         withContext(Dispatchers.IO) {
             runCatching {
                 val nodes = Tasks.await(nodeClient.connectedNodes)
+                Log.i(TAG, "Connected Wear nodes=${nodes.size}")
+                if (nodes.isEmpty()) {
+                    Log.w(TAG, "No reachable phone node; Wear OS Data Layer is disconnected")
+                    return@runCatching false
+                }
                 val bootstrapPayload =
                     SyncJsonCodec.encodeBootstrapRequest(
                         BootstrapRequest(
@@ -36,15 +41,14 @@ class WearSyncTransport(
                     )
                 var sent = false
                 nodes.forEach { node ->
-                    if (!secureCodec.hasPeerKey(node.id)) {
-                        Tasks.await(
-                            messageClient.sendMessage(
-                                node.id,
-                                SyncPaths.KEY_EXCHANGE_REQUEST,
-                                secureCodec.createKeyExchangePayload(),
-                            )
+                    Log.i(TAG, "Requesting bootstrap node=${node.id} limit=$limit offset=$offset")
+                    Tasks.await(
+                        messageClient.sendMessage(
+                            node.id,
+                            SyncPaths.KEY_EXCHANGE_REQUEST,
+                            secureCodec.createKeyExchangePayload(),
                         )
-                    }
+                    )
                     Tasks.await(
                         messageClient.sendMessage(
                             node.id,
