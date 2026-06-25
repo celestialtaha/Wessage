@@ -1,6 +1,7 @@
 package com.wapp.wearmessage.presentation
 
 import android.content.Context
+import androidx.core.content.edit
 
 class SettingsStore(
     context: Context,
@@ -22,12 +23,12 @@ class SettingsStore(
         )
 
     fun save(settings: SettingsUiState) {
-        prefs.edit()
-            .putBoolean(KEY_HAPTICS_ENABLED, settings.hapticsEnabled)
-            .putBoolean(KEY_MARK_READ_ON_OPEN, settings.markReadOnOpen)
-            .putBoolean(KEY_GLASS_BOOST_ENABLED, settings.glassBoostEnabled)
-            .putString(KEY_SYNC_PROFILE, settings.syncProfile.name)
-            .apply()
+        prefs.edit {
+            putBoolean(KEY_HAPTICS_ENABLED, settings.hapticsEnabled)
+            putBoolean(KEY_MARK_READ_ON_OPEN, settings.markReadOnOpen)
+            putBoolean(KEY_GLASS_BOOST_ENABLED, settings.glassBoostEnabled)
+            putString(KEY_SYNC_PROFILE, settings.syncProfile.name)
+        }
     }
 
     private companion object {
